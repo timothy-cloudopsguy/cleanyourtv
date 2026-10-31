@@ -73,6 +73,7 @@ final class PlanetPanel extends Panel {
         Ui.FILL.setStrokeWidth(MAP_W / 120f * 0.62f);
         Ui.FILL.setStrokeCap(android.graphics.Paint.Cap.ROUND);
         c.drawPoints(land, Ui.FILL);
+        drawVolcanoes(c);
         List<Parsers.Quake> quakes = deck.store.quakes;
         selected = Math.max(0, Math.min(selected, quakes.size() - 1));
         for (int i = quakes.size() - 1; i >= 0; i--) {
@@ -114,6 +115,15 @@ final class PlanetPanel extends Panel {
             Ui.STROKE.setColor(Ui.TEXT);
             c.drawLine(MAP_L, y, MAP_L + MAP_W, y, Ui.STROKE);
             c.drawLine(x, MAP_T, x, MAP_T + MAP_H, Ui.STROKE);
+        }
+    }
+
+    /** A triangle for each volcano reported active. The Volcano screen has the detail. */
+    private void drawVolcanoes(Canvas c) {
+        for (VolcanoData.Report r : deck.store.volcanoReports()) {
+            if (!r.located() || !onMap(r.lat)) continue;
+            Ui.FILL.setColor(r.level.equals("ONGOING") ? 0xFFB5532F : Ui.RED);
+            VolcanoPanel.drawTriangle(c, mapX(r.lon), mapY(r.lat), 8);
         }
     }
 

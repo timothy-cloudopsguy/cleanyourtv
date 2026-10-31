@@ -18,7 +18,7 @@ import java.util.Locale;
 final class SystemPanel extends Panel {
     private static final float SPLIT = 1020f;
     private static final int HISTORY = 90;
-    private static final int FEED_ROWS = 30;
+    private static final int FEED_ROWS = 33;
     private static final long GB = 1024L * 1024 * 1024;
 
     private final ActivityManager activityManager;
@@ -127,7 +127,7 @@ final class SystemPanel extends Panel {
         List<Store.Job> jobs = deck.store.jobs;
         for (int i = 0; i < Math.min(FEED_ROWS, jobs.size()); i++) {
             Store.Job job = jobs.get(i);
-            float y = DeckView.Y0 + 76 + i * 28.5f;
+            float y = DeckView.Y0 + 72 + i * 26.5f;
             int color = !job.error.isEmpty() ? Ui.RED : job.lastGood > 0 ? Ui.GREEN : Ui.FAINT;
             Ui.FILL.setColor(color);
             c.drawCircle(l + 32, y - 7, 7, Ui.FILL);

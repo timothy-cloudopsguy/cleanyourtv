@@ -28,6 +28,9 @@ abstract class Panel {
         return false;
     }
 
+    /** Another panel is taking over the screen. */
+    void onLeave() {}
+
     void onShown() {}
 
     void onHidden() {}

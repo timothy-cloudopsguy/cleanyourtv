@@ -148,10 +148,16 @@ final class Store {
     volatile List<Parsers.Repo> repos;
     volatile int[] weeks;
     volatile int kevTotal = -1;
+    private volatile List<VolcanoData.Report> elevatedVolcanoes = Collections.emptyList();
+    private volatile List<VolcanoData.Report> weeklyVolcanoes = Collections.emptyList();
+    private volatile String elevatedJson = "";
+    private volatile String locatedJson = "[]";
     /** Aircraft in the air in OpenSky's last world snapshot; -1 until there is one. */
     volatile int flightsUp = -1;
     /** Emergency squawks anywhere in the world, across the codes in EMERGENCY_CODES. */
     volatile List<AirData.Plane> emergencies = Collections.emptyList();
+    /** Fed by both world snapshots, the Bridge's and the air map's, so the oceans are filling before the map is opened. */
+    final AirData.Estimates estimates = new AirData.Estimates(WorldMap::isWater);
     @SuppressWarnings("unchecked")
     private final List<AirData.Plane>[] emergenciesByCode = new List[EMERGENCY_CODES.length];
     /** Which of the last ISS fixes to draw as a trail: lat, lon pairs, oldest first. */
@@ -203,13 +209,31 @@ final class Store {
         // OpenSky allows 400 credits a day and a world snapshot costs 4: at this pace a TV left on all day stays well
         // inside that, with room for the air map's own use.
         jobs.add(new Job("OpenSky count", "https://opensky-network.org/api/states/all", 20 * MINUTE,
-                (f, ms) -> flightsUp = AirData.parseOpenSky(read(f), System.currentTimeMillis()).size()));
+                (f, ms) -> {
+                    long now = System.currentTimeMillis();
+                    List<AirData.Plane> world = AirData.parseOpenSky(read(f), now);
+                    flightsUp = world.size();
+                    estimates.update(world, now);
+                }));
         for (int i = 0; i < EMERGENCY_CODES.length; i++) {
             int code = i;
             emergenciesByCode[i] = Collections.emptyList();
             jobs.add(new Job("Squawk " + EMERGENCY_CODES[i], "https://api.adsb.lol/v2/sqk/" + EMERGENCY_CODES[i], MINUTE,
                     (f, ms) -> setEmergencies(code, AirData.parseRegional(read(f), System.currentTimeMillis()))));
         }
+        jobs.add(new Job("USGS alerts", "https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes", 15 * MINUTE,
+                (f, ms) -> {
+                    elevatedJson = read(f);
+                    elevatedVolcanoes = VolcanoData.parseElevated(elevatedJson, locatedJson);
+                }));
+        jobs.add(new Job("USGS alert details", "https://volcanoes.usgs.gov/hans-public/api/volcano/getCapElevated", 15 * MINUTE,
+                (f, ms) -> {
+                    locatedJson = read(f);
+                    if (!elevatedJson.isEmpty()) elevatedVolcanoes = VolcanoData.parseElevated(elevatedJson, locatedJson);
+                }));
+        // Published weekly, so a few looks a day is plenty.
+        jobs.add(new Job("Smithsonian weekly", "https://volcano.si.edu/news/WeeklyVolcanoRSS.xml", 6 * HOUR,
+                (f, ms) -> weeklyVolcanoes = VolcanoData.parseWeekly(read(f))));
         jobs.add(new Job("GitHub chart", "https://github.com/users/" + githubUser + "/contributions",
                 HOUR, (f, ms) -> calendar = Parsers.calendar(read(f))));
         // Unauthenticated GitHub allows 60 calls an hour, so these stay slow.
@@ -228,6 +252,13 @@ final class Store {
     void stop() {
         if (pool != null) pool.shutdownNow();
         pool = null;
+    }
+
+    /** Raised US alerts first, then the week's reports from around the world. */
+    List<VolcanoData.Report> volcanoReports() {
+        List<VolcanoData.Report> all = new ArrayList<>(elevatedVolcanoes);
+        all.addAll(weeklyVolcanoes);
+        return all;
     }
 
     List<Headline> headlines(int category) {

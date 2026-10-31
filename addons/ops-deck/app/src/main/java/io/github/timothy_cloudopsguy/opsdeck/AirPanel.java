@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
@@ -15,8 +16,10 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * A live traffic map on the D-pad. Arrows move the map, OK opens the controls (zoom, home, next aircraft), and the
- * channel or fast-forward keys zoom directly. Keys stay here until Back, since Left has to move the map.
+ * A live traffic map on the D-pad, where the arrows have one job in each mode. On the map they move it; OK opens the menu
+ * (zoom, home, next priority aircraft) and OK again starts picking. Picking, they hop a highlight between aircraft and OK
+ * watches the one highlighted. Watching, they hop to a neighbour and Back returns to picking. The channel or fast-forward
+ * keys zoom directly. Keys stay here until Back, since Left has to do its job in every mode.
  */
 final class AirPanel extends Panel {
     private static final int MIN_ZOOM = 3;
@@ -42,14 +45,54 @@ final class AirPanel extends Panel {
     private static final int[] ALT_FEET = {5_000, 15_000, 30_000, 45_000};
     private static final int[] ALT_COLOR = {Ui.AMBER, Ui.GREEN, Ui.CYAN, Ui.BLUE, Ui.MAGENTA};
     private static final String[] ALT_NAME = {"<5k", "<15k", "<30k", "<45k", "45k+"};
+    /** Away from every altitude colour and from emergency red, and always drawn on top. */
+    private static final int MILITARY = 0xFFFFF200;
+    private static final int ESTIMATE = 0xC0E8F1FA;
+    private static final float MILITARY_SCALE = 1.2f;
+    private static final float MILITARY_WIDE_SCALE = 0.7f;
+    /** Outline units fit within 32 either side of the middle; drawn at twice that so scaling stays sharp. */
+    private static final int SPRITE_PX = 128;
+    private static final float SPRITE_SCALE = 2f;
+    private static final float MODEL_W = 400;
+    private static final float MODEL_H = 300;
+    /** A held arrow repeats far faster than anyone can follow a highlight. */
+    private static final long HOP_REPEAT_MS = 220;
+    /** Fetching a path and route for every aircraft hopped past would soon use up the path feed's daily limit. */
+    private static final long WATCH_SETTLE_MS = 2_000;
+    private static final int LOST_AFTER_REFRESHES = 2;
+    private static final float RECENTRE_MARGIN = 40;
+    private static final long LABEL_REFRESH_MS = 5_000;
+    private static final float[][] COVERED_ON_MAP = {
+            {L + 14, T + 14, L + 590, T + 110},
+            {L + 14, B - 104, L + 800, B - 12},
+            {R - 440, B - 40, R, B},
+    };
+    private static final float[][] COVERED_WATCHING = {
+            {L + 14, T + 14, L + 590, T + 110},
+            {L + 14, B - 104, L + 800, B - 12},
+            {R - 886, B - 66 - MODEL_H, R - 486, B - 66},
+            {R - 470, T + 14, R, B},
+    };
 
     private final AirFeed feed;
     private final Paint tilePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final RectF dest = new RectF();
-    private final Path glyph = new Path();
+    // Rotating a filled path costs far more per frame than a bitmap, and hundreds are drawn: each outline is drawn once
+    // into one-channel bitmaps, about 16 KB each, and tinted by the paint.
+    private final Bitmap[] solid = new Bitmap[Aircraft.KINDS];
+    private final Bitmap[] hollow = new Bitmap[Aircraft.KINDS];
+    private final Paint spritePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Paint modelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint dashedRing = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Path face = new Path();
+    private Aircraft.Mesh model;
+    private int modelKind = -1;
+    private float[] turned;
+    private float[] depths;
+    private int[] order;
     private final Path trailPath = new Path();
-    private final float[][] dots = new float[ALT_COLOR.length + 1][];
-    private final int[] dotCount = new int[ALT_COLOR.length + 1];
+    private final float[][] dots = new float[ALT_COLOR.length + 2][];
+    private final int[] dotCount = new int[ALT_COLOR.length + 2];
     private final List<double[]> trail = new ArrayList<>();
     private final List<AirData.Plane> alarms = new ArrayList<>();
 
@@ -62,12 +105,32 @@ final class AirPanel extends Panel {
     private boolean movedByHand;
     private boolean sentHome;
     private boolean controls;
+    private boolean picking;
+    /** The aircraft highlighted while picking; null once it has been lost. */
+    private AirData.Plane target;
+    private int targetVersion = -1;
+    private int targetMissed;
+    /** Where a lost target was last known: shown, and the arrows hop on from there. */
+    private AirData.Plane lostTarget;
+    private String labelName = "";
+    private String labelLine = "";
+    private int labelColor = Ui.DIM;
+    private long labelAt;
+    private long lastHop;
+    private String hoppedFrom = "";
+    private int hopDx;
+    private int hopDy;
     private AirData.Plane selected;
+    private int selectedMissed;
+    private boolean selectedLost;
+    private long watchedSince;
     private int selectedVersion = -1;
     private boolean follow;
     private String qrFor = "";
     private boolean[][] qr;
     private int inView;
+    private int militaryInView;
+    private int estimatesInView;
     private int emergencies;
     private String emergencyName = "";
     private double[][] toGo;
@@ -78,15 +141,50 @@ final class AirPanel extends Panel {
 
     AirPanel(Deck deck, Context context) {
         super(deck);
-        feed = new AirFeed(context, deck.prefs, context.getString(io.github.timothy_cloudopsguy.opsdeck.R.string.home_lat),
+        feed = new AirFeed(context, deck.prefs, deck.store.estimates, context.getString(io.github.timothy_cloudopsguy.opsdeck.R.string.home_lat),
                 context.getString(io.github.timothy_cloudopsguy.opsdeck.R.string.home_lon));
         for (int i = 0; i < dots.length; i++) dots[i] = new float[4096];
         tilePaint.setColorFilter(new ColorMatrixColorFilter(darkMap()));
-        glyph.moveTo(0, -15);
-        glyph.lineTo(11, 12);
-        glyph.lineTo(0, 6);
-        glyph.lineTo(-11, 12);
-        glyph.close();
+        for (int kind = 0; kind < solid.length; kind++) {
+            Path outline = glyph(kind);
+            solid[kind] = sprite(outline, Paint.Style.FILL);
+            hollow[kind] = sprite(outline, Paint.Style.STROKE);
+        }
+        modelPaint.setStyle(Paint.Style.FILL);
+        dashedRing.setStyle(Paint.Style.STROKE);
+        dashedRing.setStrokeWidth(5);
+        dashedRing.setColor(Ui.TEXT);
+        dashedRing.setPathEffect(new DashPathEffect(new float[]{14, 10}, 0));
+    }
+
+    private static Bitmap sprite(Path outline, Paint.Style style) {
+        Bitmap bitmap = Bitmap.createBitmap(SPRITE_PX, SPRITE_PX, Bitmap.Config.ALPHA_8);
+        Canvas canvas = new Canvas(bitmap);
+        canvas.translate(SPRITE_PX / 2f, SPRITE_PX / 2f);
+        canvas.scale(SPRITE_SCALE, SPRITE_SCALE);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        paint.setStyle(style);
+        paint.setStrokeWidth(1.2f);
+        canvas.drawPath(outline, paint);
+        return bitmap;
+    }
+
+    /** The class's outline, mirrored about the nose-to-tail axis, with its engines or rotor. */
+    private static Path glyph(int kind) {
+        float[] half = Aircraft.outline(kind);
+        Path path = new Path();
+        path.moveTo(half[0], half[1]);
+        for (int i = 2; i < half.length; i += 2) path.lineTo(half[i], half[i + 1]);
+        for (int i = half.length - 4; i >= 2; i -= 2) path.lineTo(-half[i], half[i + 1]);
+        path.close();
+        float[] pods = Aircraft.pods(kind);
+        for (int i = 0; i < pods.length; i += 4) {
+            path.addRect(pods[i] - pods[i + 2], pods[i + 1] - pods[i + 3], pods[i] + pods[i + 2], pods[i + 1] + pods[i + 3], Path.Direction.CW);
+            if (pods[i] != 0) {
+                path.addRect(-pods[i] - pods[i + 2], pods[i + 1] - pods[i + 3], -pods[i] + pods[i + 2], pods[i + 1] + pods[i + 3], Path.Direction.CW);
+            }
+        }
+        return path;
     }
 
     /** OpenStreetMap's bright map turned night-mode: mostly grey, inverted, then dimmed toward the deck's blue. */
@@ -112,18 +210,26 @@ final class AirPanel extends Panel {
     boolean key(int key) {
         if (key == KeyEvent.KEYCODE_CHANNEL_UP || key == KeyEvent.KEYCODE_PAGE_UP || key == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) {
             zoomBy(1);
+            recentreTarget();
             return true;
         }
         if (key == KeyEvent.KEYCODE_CHANNEL_DOWN || key == KeyEvent.KEYCODE_PAGE_DOWN || key == KeyEvent.KEYCODE_MEDIA_REWIND) {
             zoomBy(-1);
+            recentreTarget();
             return true;
         }
         if (controls) return controlKey(key);
         if (Ui.isOk(key)) {
+            if (picking) {
+                if (target != null) watch(target);
+                else deck.sfx.tick();
+                return true;
+            }
             controls = true;
             deck.sfx.tick();
             return true;
         }
+        if (picking || selected != null) return hopKey(key);
         double world = TILE_PX * Math.pow(2, zoom);
         double step = PAN_STEP / world;
         switch (key) {
@@ -157,16 +263,124 @@ final class AirPanel extends Panel {
                 controls = false;
                 return true;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
-                selectNext();
+                selectPriority();
                 controls = false;
                 return true;
             default:
                 if (Ui.isOk(key)) {
-                    controls = false;
-                    deck.sfx.tick();
+                    if (selected == null) startPicking();
+                    else {
+                        controls = false;
+                        deck.sfx.tick();
+                    }
                     return true;
                 }
                 return false;
+        }
+    }
+
+    private boolean hopKey(int key) {
+        switch (key) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+                hopBy(-1, 0);
+                return true;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                hopBy(1, 0);
+                return true;
+            case KeyEvent.KEYCODE_DPAD_UP:
+                hopBy(0, -1);
+                return true;
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+                hopBy(0, 1);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private AirData.PickView pickView() {
+        boolean shapesOnly = inView > GLYPH_LIMIT;
+        return new AirData.PickView(centerX, centerY, TILE_PX * Math.pow(2, zoom), L, T, R, B, shapesOnly,
+                selected != null ? COVERED_WATCHING : COVERED_ON_MAP);
+    }
+
+    /** From the menu; stays open if nothing can be picked, as its centre slot then says to zoom in. */
+    private void startPicking() {
+        long now = System.currentTimeMillis();
+        AirData.Plane start = AirData.pickStart(feed.planes, pickView(), now);
+        if (start == null) {
+            deck.sfx.tick();
+            return;
+        }
+        controls = false;
+        picking = true;
+        hoppedFrom = "";
+        setTarget(start, now);
+        deck.sfx.confirm();
+    }
+
+    private void setTarget(AirData.Plane plane, long now) {
+        target = plane;
+        lostTarget = null;
+        targetVersion = feed.version;
+        targetMissed = 0;
+        refreshLabel(now);
+    }
+
+    private void hopBy(int dx, int dy) {
+        long now = System.currentTimeMillis();
+        if (now - lastHop < HOP_REPEAT_MS) return;
+        lastHop = now;
+        AirData.Plane from = picking ? (target != null ? target : lostTarget) : selected;
+        if (from == null) return;
+        AirData.PickView view = pickView();
+        AirData.Plane next = null;
+        // Straight back undoes the last hop, which the nearest-in-that-direction rule would not always do.
+        if (dx == -hopDx && dy == -hopDy && !hoppedFrom.isEmpty()) {
+            AirData.Plane previous = AirData.find(feed.planes, hoppedFrom);
+            if (previous != null && view.eligible(previous, now)) next = previous;
+        }
+        if (next == null) next = AirData.hop(feed.planes, from, dx, dy, view, now);
+        if (next == null) {
+            deck.sfx.tick();
+            return;
+        }
+        hoppedFrom = from.hex;
+        hopDx = dx;
+        hopDy = dy;
+        if (picking) {
+            setTarget(next, now);
+            deck.sfx.tick();
+        } else {
+            setWatched(next, now);
+            deck.sfx.tick();
+        }
+    }
+
+    /** Lost or moved by a zoom: keep what is being picked on screen. */
+    private void recentreTarget() {
+        if (!picking || target == null) return;
+        long now = System.currentTimeMillis();
+        centerX = AirData.wrapX(target.xAt(now));
+        centerY = AirData.clampY(target.yAt(now));
+    }
+
+    private void refreshLabel(long now) {
+        AirData.Plane p = target;
+        if (p == null) return;
+        labelAt = now;
+        labelName = p.name();
+        if (p.emergency()) {
+            labelLine = p.squawk + " " + AirData.squawkMeaning(p.squawk).toUpperCase(Locale.ROOT);
+            labelColor = Ui.RED;
+        } else if (p.estimated) {
+            labelLine = "ESTIMATED, HEARD " + Parsers.ago(p.timeMs, now).toUpperCase(Locale.ROOT) + " AGO";
+            labelColor = Ui.AMBER;
+        } else {
+            // A missing altitude reads as 0, so nothing is said rather than something wrong.
+            String altitude = p.altitudeFeet > 0 ? String.format(Locale.US, "%,d FT", p.altitudeFeet) : "";
+            labelLine = (p.military ? "MIL  " : "") + join(p.type, altitude);
+            labelColor = p.military ? MILITARY : Ui.TEXT;
         }
     }
 
@@ -177,12 +391,34 @@ final class AirPanel extends Panel {
             return true;
         }
         if (selected != null) {
-            selected = null;
-            follow = false;
-            trail.clear();
+            // Back to browsing from the same aircraft, with the map left where it is.
+            AirData.Plane last = selected;
+            boolean lost = selectedLost;
+            endWatch();
+            picking = true;
+            hoppedFrom = "";
+            if (lost) {
+                target = null;
+                lostTarget = last;
+            } else {
+                setTarget(last, System.currentTimeMillis());
+            }
+            return true;
+        }
+        if (picking) {
+            picking = false;
+            target = null;
+            lostTarget = null;
             return true;
         }
         return false;
+    }
+
+    private void endWatch() {
+        selected = null;
+        selectedLost = false;
+        follow = false;
+        trail.clear();
     }
 
     private void pan(double dx, double dy) {
@@ -206,36 +442,58 @@ final class AirPanel extends Panel {
         centerX = AirData.worldX(home == null ? WIDE_LON : home[1]);
         centerY = AirData.worldY(home == null ? WIDE_LAT : home[0]);
         zoom = home == null ? WIDE_ZOOM : START_ZOOM;
-        follow = false;
+        endWatch();
         deck.sfx.confirm();
     }
 
-    /** Emergencies first, then whatever is nearest: from anywhere, this is the way to the one the banner names. */
-    private void selectNext() {
+    /** Emergencies, then military, then whatever is nearest: from anywhere, this is the way to the one the banner names. */
+    private void selectPriority() {
         long now = System.currentTimeMillis();
         String current = selected == null ? "" : selected.hex;
-        AirData.Plane next = AirData.nextEmergency(alarms, current);
+        List<AirData.Plane> all = new ArrayList<>(alarms);
+        all.addAll(feed.planes);
+        AirData.Plane next = AirData.nextPriority(all, current);
         if (next == null) next = AirData.nearest(feed.planes, centerX, centerY, now, current);
         if (next == null) {
             deck.sfx.tick();
             return;
         }
-        selected = next;
-        reportedSquawk = next.emergency() ? next.squawk : "";
-        selectedVersion = feed.version;
-        follow = true;
+        watch(next);
+    }
+
+    private void watch(AirData.Plane plane) {
+        picking = false;
+        target = null;
+        lostTarget = null;
+        hoppedFrom = "";
         // Close enough for the live feed, which has the type, registration and frequent updates.
         zoom = Math.max(zoom, AirFeed.REGIONAL_MIN_ZOOM);
+        setWatched(plane, System.currentTimeMillis());
+        deck.sfx.confirm();
+    }
+
+    private void setWatched(AirData.Plane plane, long now) {
+        selected = plane;
+        selectedLost = false;
+        selectedMissed = 0;
+        reportedSquawk = plane.emergency() ? plane.squawk : "";
+        selectedVersion = feed.version;
+        follow = true;
+        watchedSince = now;
         toGoFor = "";
         trail.clear();
-        trail.add(new double[]{next.xAt(now), next.yAt(now)});
-        deck.sfx.confirm();
+        trail.add(new double[]{plane.xAt(now), plane.yAt(now)});
+    }
+
+    private boolean watchSettled(long now) {
+        return now - watchedSince >= WATCH_SETTLE_MS;
     }
 
     @Override
     void draw(Canvas c, long now) {
         settleHome();
         trackSelected(now);
+        trackTarget(now);
         animate();
         // Following keeps the live feed around the aircraft however far out the map is, to see its whole path.
         feed.poll(AirData.lat(centerY), AirData.lon(centerX), follow ? Math.max(zoom, AirFeed.REGIONAL_MIN_ZOOM) : zoom, now);
@@ -255,7 +513,11 @@ final class AirPanel extends Panel {
         drawCrosshair(c);
         c.restoreToCount(saved);
         drawHud(c, now);
-        if (selected != null) drawCard(c, now);
+        if (picking) drawTarget(c, world, now);
+        if (selected != null) {
+            drawCard(c, now);
+            drawModel(c, now);
+        }
         if (controls) drawControls(c);
     }
 
@@ -284,14 +546,44 @@ final class AirPanel extends Panel {
             }
             if (fresh != null) {
                 selected = fresh;
+                selectedMissed = 0;
+                selectedLost = false;
+                follow = true;
                 trail.add(new double[]{fresh.worldX, fresh.worldY});
                 if (trail.size() > TRAIL_MAX) trail.remove(0);
+            } else if (++selectedMissed >= LOST_AFTER_REFRESHES) {
+                // Said out loud, rather than following a position that is no longer being reported.
+                selectedLost = true;
+                follow = false;
             }
         }
         if (follow) {
             centerX = AirData.wrapX(selected.xAt(now));
             centerY = AirData.clampY(selected.yAt(now));
         }
+    }
+
+    /** Follows the highlighted aircraft through refreshes. It never moves to another by itself: if lost, that is shown. */
+    private void trackTarget(long now) {
+        if (!picking || target == null) return;
+        if (targetVersion != feed.version) {
+            targetVersion = feed.version;
+            AirData.Plane fresh = AirData.find(feed.planes, target.hex);
+            if (fresh != null) {
+                target = fresh;
+                targetMissed = 0;
+                refreshLabel(now);
+            } else if (++targetMissed >= LOST_AFTER_REFRESHES) {
+                lostTarget = target;
+                target = null;
+                return;
+            }
+        }
+        if (now - labelAt >= LABEL_REFRESH_MS) refreshLabel(now);
+        double world = TILE_PX * Math.pow(2, zoom);
+        float x = (float) (MX + AirData.wrapDelta(target.xAt(now) - centerX) * world);
+        float y = (float) (MY + (target.yAt(now) - centerY) * world);
+        if (x < L + RECENTRE_MARGIN || x > R - RECENTRE_MARGIN || y < T + RECENTRE_MARGIN || y > B - RECENTRE_MARGIN) recentreTarget();
     }
 
     private void animate() {
@@ -361,7 +653,7 @@ final class AirPanel extends Panel {
 
     /** The path actually flown, coloured by altitude as the aircraft are. */
     private void drawTrack(Canvas c, double world, long now) {
-        if (selected == null) return;
+        if (selected == null || !watchSettled(now)) return;
         AirData.Track track = feed.track(selected.hex, now);
         if (track == null) return;
         Ui.STROKE.setStrokeWidth(4);
@@ -388,7 +680,7 @@ final class AirPanel extends Panel {
 
     /** Dashes on to the destination and a mark at each end. The route is looked up by flight number, so it is a best guess. */
     private void drawRoute(Canvas c, double world, long now) {
-        if (selected == null) return;
+        if (selected == null || !watchSettled(now)) return;
         AirData.Route route = feed.route(selected.callsign);
         if (route == null) return;
         if (route.toPoint != null) {
@@ -449,6 +741,8 @@ final class AirPanel extends Panel {
     private void drawPlanes(Canvas c, double world, long now) {
         List<AirData.Plane> planes = feed.planes;
         int visible = 0;
+        int militaryCount = 0;
+        int estimateCount = 0;
         alarms.clear();
         for (int i = 0; i < dotCount.length; i++) dotCount[i] = 0;
         // First pass decides dots or arrows, and doubles as the count the HUD shows.
@@ -460,6 +754,12 @@ final class AirPanel extends Panel {
             float y = screenY(p.yAt(now), world);
             if (x < L || x > R || y < T || y > B) continue;
             visible++;
+            if (p.estimated) estimateCount++;
+            if (p.military) {
+                // Drawn as a shape at every zoom, so never one of the dots.
+                militaryCount++;
+                continue;
+            }
             int bucket = bucket(p);
             float[] points = dots[bucket];
             int used = dotCount[bucket];
@@ -477,12 +777,19 @@ final class AirPanel extends Panel {
             if (!known && p.emergency()) alarms.add(p);
         }
         inView = visible;
+        militaryInView = militaryCount;
+        estimatesInView = estimateCount;
         emergencies = alarms.size();
         emergencyName = alarms.isEmpty() ? "" : alarms.get(0).name() + " " + alarms.get(0).squawk;
         if (visible > GLYPH_LIMIT) {
             drawDots(c);
         } else {
-            for (int i = 0; i < planes.size(); i++) drawGlyph(c, planes.get(i), world, now, visible, selected != null);
+            for (int i = 0; i < planes.size(); i++) {
+                if (!planes.get(i).military) drawGlyph(c, planes.get(i), world, now, visible, selected != null);
+            }
+        }
+        for (int i = 0; i < planes.size(); i++) {
+            if (planes.get(i).military) drawGlyph(c, planes.get(i), world, now, visible, selected != null);
         }
     }
 
@@ -495,6 +802,44 @@ final class AirPanel extends Panel {
         Ui.STROKE.setColor(Ui.TEXT);
         Ui.STROKE.setStrokeWidth(3);
         c.drawCircle(x, y, 26 + pulse * 6, Ui.STROKE);
+    }
+
+    /** The highlight and its small label. Hollow aircraft get a dashed ring: their position is a guess. */
+    private void drawTarget(Canvas c, double world, long now) {
+        AirData.Plane p = target != null ? target : lostTarget;
+        if (p == null) return;
+        float x = screenX(p.xAt(now), world);
+        float y = screenY(p.yAt(now), world);
+        String name;
+        String line;
+        int color;
+        if (target != null) {
+            drawGlyph(c, p, world, now, 0, false);
+            Ui.STROKE.setColor(0xE0060A12);
+            Ui.STROKE.setStrokeWidth(9);
+            c.drawCircle(x, y, 34, Ui.STROKE);
+            if (p.estimated) {
+                c.drawCircle(x, y, 34, dashedRing);
+            } else {
+                Ui.STROKE.setColor(Ui.TEXT);
+                Ui.STROKE.setStrokeWidth(5);
+                c.drawCircle(x, y, 34, Ui.STROKE);
+            }
+            name = labelName;
+            line = labelLine;
+            color = labelColor;
+        } else {
+            name = "LOST " + p.name();
+            line = "PRESS AN ARROW";
+            color = Ui.AMBER;
+        }
+        float width = 36 + Math.max(name.length() * 18.5f, line.length() * 14.8f);
+        float height = line.isEmpty() ? 52 : 88;
+        float left = x + 44 + width > R - 10 ? x - 44 - width : x + 44;
+        float top = Math.max(T + 10, Math.min(B - 112 - height, y - height / 2));
+        Ui.card(c, left, top, left + width, top + height, 0xF0060A12);
+        Ui.bold(c, name, left + 18, top + 38, 30, target != null && p.emergency() ? Ui.RED : Ui.TEXT);
+        if (!line.isEmpty()) Ui.mono(c, line, left + 18, top + 72, 24, color);
     }
 
     private void drawDots(Canvas c) {
@@ -518,16 +863,27 @@ final class AirPanel extends Panel {
         int saved = c.save();
         c.translate(x, y);
         c.rotate(p.track);
-        int color = p.emergency() ? Ui.RED : bucketColor(bucket(p));
-        Ui.FILL.setColor(dim ? dimmed(color) : color);
-        c.drawPath(glyph, Ui.FILL);
+        float size = 1 / SPRITE_SCALE;
+        if (p.military) size *= zoom < AirFeed.REGIONAL_MIN_ZOOM ? MILITARY_WIDE_SCALE : MILITARY_SCALE;
+        c.scale(size, size);
+        int color = planeColor(p);
+        spritePaint.setColor(dim ? dimmed(color) : color);
+        // Hollow: an estimate is a guess at where it is, not a report.
+        c.drawBitmap(p.estimated ? hollow[p.kind] : solid[p.kind], -SPRITE_PX / 2f, -SPRITE_PX / 2f, spritePaint);
         c.restoreToCount(saved);
         if (!dim && visible > 0 && zoom >= LABEL_MIN_ZOOM && visible <= LABEL_LIMIT && !p.ground) {
             Ui.mono(c, p.name(), x + 20, y + 7, 19, Ui.TEXT);
         }
     }
 
+    private static int planeColor(AirData.Plane p) {
+        if (p.emergency()) return Ui.RED;
+        if (p.military) return MILITARY;
+        return bucketColor(bucket(p));
+    }
+
     private static int bucket(AirData.Plane p) {
+        if (p.estimated) return ALT_COLOR.length + 1;
         if (p.ground) return ALT_COLOR.length;
         return altitudeBucket(p.altitudeFeet);
     }
@@ -542,11 +898,13 @@ final class AirPanel extends Panel {
     }
 
     private static int bucketColor(int bucket) {
+        if (bucket > ALT_COLOR.length) return ESTIMATE;
         return bucket < ALT_COLOR.length ? ALT_COLOR[bucket] : Ui.FAINT;
     }
 
     private void drawCrosshair(Canvas c) {
-        if (follow) return;
+        // Only on the map: seeing a crosshair or a ring tells which mode this is at a glance.
+        if (picking || selected != null) return;
         Ui.FILL.setColor(0xB0E8F1FA);
         c.drawRect(MX - 16, MY - 1, MX - 5, MY + 1, Ui.FILL);
         c.drawRect(MX + 5, MY - 1, MX + 16, MY + 1, Ui.FILL);
@@ -557,6 +915,8 @@ final class AirPanel extends Panel {
     private void drawHud(Canvas c, long now) {
         Ui.card(c, L + 14, T + 14, L + 590, T + 110, 0xE0060A12);
         Ui.bold(c, Ui.number(inView) + " IN VIEW", L + 32, T + 58, 34, Ui.TEXT);
+        Ui.right(c, militaryInView + " MIL", L + 470, T + 58, 24, MILITARY);
+        Ui.right(c, estimatesInView + " EST", L + 575, T + 58, 24, ESTIMATE);
         String from = feed.source.isEmpty() ? (feed.locating ? "Finding this TV..." : "Pulling traffic...")
                 : feed.source + ", " + Parsers.ago(feed.updated, now) + " ago";
         Ui.mono(c, "z" + zoom + "  " + from, L + 32, T + 94, 21, Ui.DIM);
@@ -574,15 +934,40 @@ final class AirPanel extends Panel {
         Ui.right(c, "(c) OpenStreetMap contributors", R - 12, B - 12, 19, Ui.DIM);
 
         float y = B - 56;
-        Ui.card(c, L + 14, y, L + 1120, B - 12, 0xE0060A12);
+        drawModeBar(c);
+        Ui.card(c, L + 14, y, L + 800, B - 12, 0xE0060A12);
         float x = L + 30;
         for (int i = 0; i < ALT_NAME.length; i++) {
             Ui.FILL.setColor(ALT_COLOR[i]);
             c.drawCircle(x + 7, y + 22, 7, Ui.FILL);
             Ui.mono(c, ALT_NAME[i], x + 20, y + 30, 19, Ui.DIM);
-            x += 92;
+            x += 86;
         }
-        Ui.mono(c, focused ? "ARROWS MOVE  OK CONTROLS  BACK EXIT" : "RIGHT OR OK TO FLY THE MAP", x + 10, y + 30, 21, Ui.TEXT);
+        Ui.FILL.setColor(MILITARY);
+        c.drawCircle(x + 7, y + 22, 7, Ui.FILL);
+        Ui.mono(c, "MIL", x + 20, y + 30, 19, Ui.DIM);
+        x += 86;
+        Ui.STROKE.setColor(ESTIMATE);
+        Ui.STROKE.setStrokeWidth(2);
+        c.drawCircle(x + 7, y + 22, 6, Ui.STROKE);
+        Ui.mono(c, "EST", x + 20, y + 30, 19, Ui.DIM);
+        x += 86;
+    }
+
+    /** What the arrows do right now, always in the same place. */
+    private void drawModeBar(Canvas c) {
+        String mode = !focused ? "AIR" : selected != null ? "WATCH" : picking ? "PICK" : "MAP";
+        String hint = !focused ? "RIGHT OR OK TO FLY THE MAP"
+                : selected != null ? "ARROWS HOP  OK MENU  BACK PICK"
+                : picking ? (target != null ? "ARROWS NEXT AIRCRAFT  OK WATCH  BACK MAP" : "ARROWS NEXT AIRCRAFT  BACK MAP")
+                : "ARROWS MOVE  OK MENU  OK OK PICK";
+        float top = B - 104;
+        float bottom = B - 62;
+        float chip = 28 + mode.length() * 15.6f;
+        Ui.card(c, L + 14, top, L + 14 + chip + 24 + hint.length() * 15.6f + 16, bottom, 0xF0060A12);
+        Ui.card(c, L + 14, top, L + 14 + chip, bottom, Ui.BLUE);
+        Ui.mono(c, mode, L + 28, bottom - 12, 26, Ui.BG);
+        Ui.mono(c, hint, L + 14 + chip + 18, bottom - 12, 26, Ui.TEXT);
     }
 
     private void drawCard(Canvas c, long now) {
@@ -604,10 +989,19 @@ final class AirPanel extends Panel {
             y += 34;
         }
         if (p.military) {
-            Ui.bold(c, "MILITARY", l + 22, y, 23, Ui.AMBER);
+            Ui.bold(c, "MILITARY", l + 22, y, 23, MILITARY);
             y += 34;
         }
-        AirData.Route route = feed.route(p.callsign);
+        if (p.estimated) {
+            Ui.bold(c, "ESTIMATED, LAST HEARD " + Parsers.ago(p.timeMs, now).toUpperCase(Locale.ROOT) + " AGO", l + 22, y, 23, Ui.AMBER);
+            y += 34;
+        }
+        if (selectedLost) {
+            Ui.bold(c, "SIGNAL LOST, LAST HEARD " + Parsers.ago(p.timeMs, now).toUpperCase(Locale.ROOT) + " AGO", l + 22, y, 23, Ui.AMBER);
+            y += 34;
+        }
+        boolean settled = watchSettled(now);
+        AirData.Route route = settled ? feed.route(p.callsign) : null;
         if (route != null) {
             if (!route.airline.isEmpty()) {
                 Ui.line(c, route.airline, l + 22, y, r - l - 44, 25, Ui.CYAN, Ui.SANS);
@@ -625,7 +1019,8 @@ final class AirPanel extends Panel {
                     AirData.lon(p.xAt(now)), route.toPoint[0], route.toPoint[1])), l, y);
         }
         AirData.Track track = feed.currentTrack;
-        y = field(c, "FLOWN", track != null ? String.format(Locale.US, "%,d nm seen", track.flownNm) : feed.trackState, l, y);
+        // Until it settles, this could still be the path of the aircraft hopped from.
+        y = field(c, "FLOWN", !settled ? "" : track != null ? String.format(Locale.US, "%,d nm seen", track.flownNm) : feed.trackState, l, y);
         y = field(c, "TYPE", join(p.type, p.registration), l, y);
         y = field(c, "ALTITUDE", p.ground ? "on the ground" : String.format(Locale.US, "%,d ft %s", p.altitudeFeet, climbWord(p.climbFpm)), l, y);
         y = field(c, "SPEED", p.speedKnots + " kt", l, y);
@@ -638,8 +1033,96 @@ final class AirPanel extends Panel {
         }
         if (qr != null) Ui.qr(c, qr, l + 22, b - 182, 164);
         Ui.mono(c, "SCAN TO TRACK", l + 200, b - 118, 20, Ui.TEXT);
-        Ui.mono(c, follow ? "Following" : "Arrows left it", l + 200, b - 88, 20, Ui.DIM);
-        Ui.mono(c, "Back deselects", l + 200, b - 58, 20, Ui.DIM);
+        Ui.mono(c, follow ? "Following" : "Not following", l + 200, b - 88, 20, Ui.DIM);
+        Ui.mono(c, "Back to browse", l + 200, b - 58, 20, Ui.DIM);
+    }
+
+    /** The selected aircraft's class as a slowly turning solid: its faces are flat-shaded and painted back to front. */
+    private void drawModel(Canvas c, long now) {
+        int kind = selected.kind;
+        if (kind == Aircraft.UNKNOWN) return;
+        if (kind != modelKind) {
+            modelKind = kind;
+            model = Aircraft.model(kind);
+            turned = new float[model.vertices.length];
+            depths = new float[model.faces.length / 4];
+            order = new int[depths.length];
+            for (int i = 0; i < order.length; i++) order[i] = i;
+        }
+        float r = R - 486;
+        float l = r - MODEL_W;
+        float b = B - 66;
+        float t = b - MODEL_H;
+        Ui.card(c, l, t, r, b, 0xF0060A12);
+        Ui.bold(c, Aircraft.name(kind).toUpperCase(Locale.ROOT), l + 18, t + 36, 23, Ui.TEXT);
+        Ui.mono(c, "SHAPE OF ITS CLASS, NOT THIS AIRFRAME", l + 18, b - 14, 15, Ui.FAINT);
+
+        double yaw = (now % 16_000) / 16_000.0 * 2 * Math.PI;
+        float cosY = (float) Math.cos(yaw);
+        float sinY = (float) Math.sin(yaw);
+        float cosP = 0.92f;
+        float sinP = 0.39f;
+        float scale = MODEL_W * 0.62f;
+        float cx = (l + r) / 2;
+        float cy = (t + b) / 2 + 8;
+        float[] v = model.vertices;
+        for (int i = 0; i < v.length; i += 3) {
+            float x = v[i] * cosY - v[i + 1] * sinY;
+            float y = v[i] * sinY + v[i + 1] * cosY;
+            turned[i] = x;
+            turned[i + 1] = y * cosP + v[i + 2] * sinP;
+            turned[i + 2] = y * sinP - v[i + 2] * cosP;
+        }
+        int[] faces = model.faces;
+        for (int f = 0; f < depths.length; f++) {
+            float sum = 0;
+            for (int k = 0; k < 4; k++) sum += turned[faces[f * 4 + k] * 3 + 1];
+            depths[f] = sum;
+        }
+        // Barely changes between frames, and allocates nothing.
+        for (int i = 1; i < order.length; i++) {
+            int value = order[i];
+            int j = i - 1;
+            while (j >= 0 && depths[order[j]] > depths[value]) {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = value;
+        }
+        int color = selected.military ? MILITARY : Ui.BLUE;
+        for (int n = order.length - 1; n >= 0; n--) {
+            int f = order[n] * 4;
+            int a = faces[f] * 3;
+            int e = faces[f + 1] * 3;
+            int g = faces[f + 2] * 3;
+            int h = faces[f + 3] * 3;
+            modelPaint.setColor(shade(color, a, e, g, h));
+            face.rewind();
+            face.moveTo(cx + turned[a] * scale, cy + turned[a + 2] * scale);
+            face.lineTo(cx + turned[e] * scale, cy + turned[e + 2] * scale);
+            face.lineTo(cx + turned[g] * scale, cy + turned[g + 2] * scale);
+            face.lineTo(cx + turned[h] * scale, cy + turned[h + 2] * scale);
+            face.close();
+            c.drawPath(face, modelPaint);
+        }
+    }
+
+    /** Brightness from how squarely a face meets a light above the viewer, either side of it. */
+    private int shade(int color, int a, int e, int g, int h) {
+        float ux = turned[g] - turned[a];
+        float uy = turned[g + 1] - turned[a + 1];
+        float uz = turned[g + 2] - turned[a + 2];
+        float vx = turned[h] - turned[e];
+        float vy = turned[h + 1] - turned[e + 1];
+        float vz = turned[h + 2] - turned[e + 2];
+        float nx = uy * vz - uz * vy;
+        float ny = uz * vx - ux * vz;
+        float nz = ux * vy - uy * vx;
+        float length = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+        float light = length < 1e-6f ? 0.5f : Math.abs(0.3f * nx + 0.5f * ny - 0.81f * nz) / length;
+        float level = 0.28f + 0.72f * light;
+        return 0xFF000000 | ((int) (((color >> 16) & 255) * level) << 16)
+                | ((int) (((color >> 8) & 255) * level) << 8) | (int) ((color & 255) * level);
     }
 
     private static float field(Canvas c, String name, String value, float l, float y) {
@@ -659,7 +1142,7 @@ final class AirPanel extends Panel {
     }
 
     private void drawControls(Canvas c) {
-        float w = 620;
+        float w = 760;
         float h = 400;
         float l = MX - w / 2;
         float t = MY - h / 2;
@@ -675,9 +1158,16 @@ final class AirPanel extends Panel {
         Ui.centre(c, "HOME", l + 120, t + 242, 22, Ui.DIM);
         Ui.centre(c, "RIGHT", l + w - 130, t + 210, 30, Ui.TEXT);
         boolean anyEmergency = emergencies > 0;
-        Ui.centre(c, anyEmergency ? "NEXT EMERGENCY" : "NEXT AIRCRAFT", l + w - 130, t + 242, 22, anyEmergency ? Ui.RED : Ui.DIM);
+        boolean anyMilitary = false;
+        for (int i = 0; i < feed.planes.size() && !anyMilitary; i++) anyMilitary = feed.planes.get(i).military;
+        Ui.centre(c, anyEmergency ? "NEXT EMERGENCY" : anyMilitary ? "NEXT MILITARY" : "NEAREST AIRCRAFT", l + w - 130, t + 242, 22,
+                anyEmergency ? Ui.RED : anyMilitary ? MILITARY : Ui.DIM);
+        Ui.centre(c, "OK", MX, t + 210, 30, Ui.BLUE);
+        String middle = selected != null ? "CLOSE MENU"
+                : AirData.pickStart(feed.planes, pickView(), System.currentTimeMillis()) != null ? "PICK AIRCRAFT" : "ZOOM IN TO PICK";
+        Ui.centre(c, middle, MX, t + 242, 22, Ui.BLUE);
         Ui.centre(c, "DOWN", MX, t + 300, 30, Ui.TEXT);
         Ui.centre(c, "ZOOM OUT", MX, t + 332, 22, Ui.DIM);
-        Ui.centre(c, "OK CLOSES", MX, t + 382, 20, Ui.FAINT);
+        Ui.centre(c, "BACK CLOSES", MX, t + 382, 20, Ui.FAINT);
     }
 }

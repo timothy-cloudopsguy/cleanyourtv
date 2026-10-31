@@ -12,7 +12,8 @@ it, and Back or Left comes out again.
 | Intel | Four desks. Vulns: CISA's known exploited list, The Hacker News, Krebs on Security. Tech: Hacker News, Ars Technica. Science: Quanta, NASA, ScienceDaily. History: Wikipedia's On This Day, Smithsonian. Each story has its summary and a QR code for your phone; OK reads it here in a small built-in browser |
 | Status | GitHub, Cloudflare, Claude, OpenAI and Discord: status, response time from this TV as a trace, open incidents, degraded components |
 | Planet | A dot-matrix world with the last day's M4.5+ earthquakes and the ISS with its trail; the planetary K index |
-| Air | A live air traffic map, starting where the TV is. Arrows move anywhere in the world; OK opens the controls (zoom, home, next aircraft) and the channel keys zoom too. Pick an aircraft to follow it and see the path it has flown, coloured by altitude, a dashed line to its likely destination, its type, altitude and speed, and a QR code to track it. Emergency squawks (7500, 7600, 7700) pulse red at every zoom, and Next goes to them first. They are what a feed reports, and the card says so when the feeds disagree |
+| Volcano | Activity: raised US alerts and the Smithsonian / USGS weekly report, also marked on Planet's map. Cams: 20 cameras, 12 of them live video. Wall: up to six favourites. Observatory cameras show current pictures; the first two other streams play muted live video in their tiles (a TV like this lists two video decoders); any others show the channel's poster and say so. OK plays a stream full screen in the TV's YouTube app |
+| Air | A live air traffic map, starting where the TV is. Arrows move anywhere in the world; OK opens the menu (zoom, home, next emergency or military) and the channel keys zoom too. OK twice starts picking: the arrows then hop a highlight from aircraft to aircraft, and OK watches the one highlighted. Watching follows it and shows the path it has flown, coloured by altitude, a dashed line to its likely destination, its type, altitude and speed, and a QR code to track it. Emergency squawks (7500, 7600, 7700) pulse red at every zoom, and Next goes to them first. They are what a feed reports, and the card says so when the feeds disagree. Military aircraft are yellow at every zoom, as far as the feeds' databases list them. Each aircraft has an outline for its class, and the selected one a turning 3D model of that class. Free feeds hear nothing mid-ocean, so an aircraft that drops out while cruising is flown on along its last track for up to 90 minutes while that stays over water: these are hollow, marked EST, and are guesses |
 | Git | The contribution chart with a day-by-day cursor, streaks, public repositories, and one watched repository's weekly commits |
 | System | Memory, storage, live network use, the health of every feed, and the sound switch |
 | Game | Incident Commander: fix alerts across a rack before they burn your error budget |
@@ -35,10 +36,14 @@ it, and Back or Left comes out again.
   services see an ordinary request from your address. No telemetry and no ads.
 - A `<queries>` entry for TV launcher activities, not a permission: it lists the apps for the Bridge's row.
 
+The Volcano screen reads USGS and the Smithsonian's weekly report while the app is open, and fetches camera pictures from
+USGS, the Alaska Volcano Observatory and YouTube only while they are on screen. Live streams belong to their channels (USGS,
+AfarTV), play in the YouTube app under its own terms, and may move when a channel restarts one; the card then opens the channel.
+
 The air map fetches only while it is on screen: adsb.lol or adsb.fi for live traffic around the map's centre, OpenSky for
 the zoomed-out world view (every two minutes, within its free limit of 400 credits a day) and the Bridge's flight count (every 20 minutes while the app is open), adsbdb for a selected flight's
 route, OpenSky for its flown path and OpenStreetMap for map tiles (kept in the app's cache so each is fetched once). To find where to start, ipwho.is works out a rough location
-from the TV's internet address; only the latitude and longitude are kept, on the TV. adsb.lol is also asked each minute while the app is open for emergency squawks worldwide. Those services receive the map
+from the TV's internet address; only the latitude and longitude are kept, on the TV. adsb.fi (or adsb.lol if it fails) is asked each minute while the map is on screen for military aircraft worldwide. adsb.lol is also asked each minute while the app is open for emergency squawks worldwide. Those services receive the map
 area or flight being looked at. The map shows what volunteer and research receivers hear, so it is not every flight, and
 it is for fun, not for navigation or safety.
 

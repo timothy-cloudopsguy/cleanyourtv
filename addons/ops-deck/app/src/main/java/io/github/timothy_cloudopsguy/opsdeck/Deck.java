@@ -25,6 +25,12 @@ final class Deck {
         void launch(String packageName);
         /** Opens a link in the reader; says so when it cannot. */
         void openLink(String url);
+        /** Plays a stream in the TV's own video app. */
+        void watch(String url);
+        /** Plays these streams muted over the given screen rectangles {l, t, r, b}; an empty list stops them. */
+        void showLive(java.util.List<String> videoIds, java.util.List<float[]> boxes);
+        /** Keeps loaded streams but takes them off the screen, while an overlay is up. */
+        void setLiveVisible(boolean visible);
     }
 
     final Store store;
@@ -32,6 +38,8 @@ final class Deck {
     final SharedPreferences prefs;
     final Actions actions;
     volatile List<App> apps = Collections.emptyList();
+    /** What the live tiles are playing now, so they restart only when it changes. */
+    String liveKey = "";
 
     Deck(Store store, Sfx sfx, SharedPreferences prefs, Actions actions) {
         this.store = store;

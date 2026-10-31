@@ -1,5 +1,6 @@
 package io.github.timothy_cloudopsguy.opsdeck;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
@@ -11,8 +12,16 @@ import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.drawable.Drawable;
+import android.net.Uri;
 import android.os.Bundle;
+import android.util.AndroidRuntimeException;
+import android.view.View;
 import android.view.WindowManager;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.FrameLayout;
 import android.widget.Toast;
 
 import java.util.ArrayList;
@@ -28,6 +37,10 @@ public final class DeckActivity extends Activity implements Deck.Actions {
     private Store store;
     private Sfx sfx;
     private DeckView view;
+    private FrameLayout root;
+    private final List<WebView> liveViews = new ArrayList<>();
+    private boolean visible;
+    private boolean liveVisible = true;
     private Deck deck;
 
     @Override
@@ -44,13 +57,16 @@ public final class DeckActivity extends Activity implements Deck.Actions {
                 new IntelPanel(deck),
                 new StatusPanel(deck),
                 new PlanetPanel(deck),
+                new VolcanoPanel(deck, this),
                 new AirPanel(deck, this),
                 new GitPanel(deck),
                 new SystemPanel(deck, this),
                 new GamePanel(deck),
         };
         view = new DeckView(this, deck, panels);
-        setContentView(view);
+        root = new FrameLayout(this);
+        root.addView(view);
+        setContentView(root);
         view.requestFocus();
         new Thread(this::loadApps, "apps").start();
     }
@@ -58,6 +74,7 @@ public final class DeckActivity extends Activity implements Deck.Actions {
     @Override
     protected void onStart() {
         super.onStart();
+        visible = true;
         store.start();
         view.resume();
     }
@@ -66,6 +83,10 @@ public final class DeckActivity extends Activity implements Deck.Actions {
     protected void onStop() {
         view.pause();
         store.stop();
+        // Decoders and memory go back as soon as the app is out of sight. The panel starts them again on return.
+        visible = false;
+        applyLive(Collections.emptyList(), Collections.emptyList());
+        deck.liveKey = "";
         super.onStop();
     }
 
@@ -104,6 +125,80 @@ public final class DeckActivity extends Activity implements Deck.Actions {
         if (!ReaderActivity.open(this, url)) {
             Toast.makeText(this, "No page for this one: try the code with your phone", Toast.LENGTH_LONG).show();
         }
+    }
+
+    @Override
+    public void watch(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (ActivityNotFoundException | SecurityException e) {
+            Toast.makeText(this, "Nothing on this TV can play that stream", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    public void showLive(List<String> videoIds, List<float[]> boxes) {
+        // Panels ask from onDraw, and adding or removing a view during a draw crashes the renderer.
+        root.post(() -> applyLive(videoIds, boxes));
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private void applyLive(List<String> videoIds, List<float[]> boxes) {
+        if (!visible && !videoIds.isEmpty()) return;
+        for (WebView old : liveViews) {
+            root.removeView(old);
+            old.destroy();
+        }
+        liveViews.clear();
+        float scale = view.getWidth() / DeckView.W;
+        for (int i = 0; i < videoIds.size(); i++) {
+            WebView web;
+            try {
+                web = new WebView(this);
+            } catch (AndroidRuntimeException e) {
+                return;
+            }
+            WebSettings settings = web.getSettings();
+            settings.setJavaScriptEnabled(true);
+            settings.setDomStorageEnabled(true);
+            settings.setAllowFileAccess(false);
+            settings.setAllowContentAccess(false);
+            settings.setMediaPlaybackRequiresUserGesture(false);
+            web.setFocusable(false);
+            web.setFocusableInTouchMode(false);
+            web.setBackgroundColor(Ui.BG);
+            web.setWebViewClient(new WebViewClient() {
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
+                    return true;
+                }
+            });
+            float[] box = boxes.get(i);
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                    Math.round((box[2] - box[0]) * scale), Math.round((box[3] - box[1]) * scale));
+            params.leftMargin = Math.round(box[0] * scale);
+            params.topMargin = Math.round(box[1] * scale);
+            web.setVisibility(liveVisible ? View.VISIBLE : View.INVISIBLE);
+            root.addView(web, params);
+            liveViews.add(web);
+            String html = "<!doctype html><html><body style='margin:0;background:#060a12'>"
+                    + "<iframe src='https://www.youtube-nocookie.com/embed/" + videoIds.get(i)
+                    + "?autoplay=1&mute=1&controls=0&playsinline=1&modestbranding=1' style='border:0;width:100vw;height:100vh'"
+                    + " allow='autoplay; encrypted-media' referrerpolicy='strict-origin-when-cross-origin'></iframe></body></html>";
+            // YouTube's player refuses to run without a referring page, so the frame needs a real-looking origin.
+            web.loadDataWithBaseURL("https://" + getPackageName().replace('_', '-') + "/", html, "text/html", "utf-8", null);
+        }
+    }
+
+    @Override
+    public void setLiveVisible(boolean show) {
+        if (show == liveVisible) return;
+        liveVisible = show;
+        root.post(this::applyLiveVisible);
+    }
+
+    private void applyLiveVisible() {
+        for (WebView web : liveViews) web.setVisibility(liveVisible ? View.VISIBLE : View.INVISIBLE);
     }
 
     private void loadApps() {

@@ -28,7 +28,7 @@ final class BridgePanel extends Panel {
     private static final double TICKER_SPEED = 0.09;
 
     private final String[] label = {"SERVICES", "EXPLOITED CVES", "ON THIS DAY", "QUAKES M4.5+", "SPACE", "AIR TRAFFIC", "GIT", "HIGH SCORE"};
-    private final int[] target = {2, 1, 1, 3, 3, 4, 5, 7};
+    private final int[] target = {2, 1, 1, 3, 3, 5, 6, 8};
     private final String[] value = new String[TILES];
     private final String[] sub = new String[TILES];
     private final int[] tone = new int[TILES];

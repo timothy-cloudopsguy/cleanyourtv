@@ -78,6 +78,7 @@ final class DeckView extends View {
     void openPanel(int index) {
         if (index == current) return;
         panels[current].onHidden();
+        panels[current].onLeave();
         current = index;
         panels[current].onShown();
     }

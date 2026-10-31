@@ -41,6 +41,10 @@ final class AirFeed {
 
     private static final String REGIONAL_LOL = "https://api.adsb.lol/v2/lat/%.3f/lon/%.3f/dist/%d";
     private static final String REGIONAL_FI = "https://opendata.adsb.fi/api/v2/lat/%.3f/lon/%.3f/dist/%d";
+    private static final String MILITARY_FI = "https://opendata.adsb.fi/api/v2/mil";
+    private static final String MILITARY_LOL = "https://api.adsb.lol/v2/mil";
+    private static final long MILITARY_MS = 60_000;
+    private static final long MILITARY_RETRY_MS = 3 * 60_000;
     private static final String WORLD = "https://opensky-network.org/api/states/all";
     private static final String TRACK = "https://opensky-network.org/api/tracks/all?time=0&icao24=";
     private static final long TRACK_REFRESH_MS = 5 * 60_000;
@@ -61,6 +65,10 @@ final class AirFeed {
     private volatile String trackHex = "";
     private long trackAsked;
 
+    private final AirData.Estimates estimates;
+    private volatile List<AirData.Plane> military = Collections.emptyList();
+    private volatile boolean militaryBusy;
+    private volatile long militaryDue;
     private final File dir;
     private final File tileDir;
     private final SharedPreferences prefs;
@@ -81,7 +89,8 @@ final class AirFeed {
     private double lastLon;
     private long worldLimitedUntil;
 
-    AirFeed(Context context, SharedPreferences prefs, String homeLat, String homeLon) {
+    AirFeed(Context context, SharedPreferences prefs, AirData.Estimates estimates, String homeLat, String homeLon) {
+        this.estimates = estimates;
         dir = context.getCacheDir();
         tileDir = new File(dir, "osm-tiles");
         tileDir.mkdirs();
@@ -106,6 +115,10 @@ final class AirFeed {
     void poll(double lat, double lon, int zoom, long now) {
         locateOnce(now);
         wantRegional = zoom >= REGIONAL_MIN_ZOOM;
+        if (now >= militaryDue && !militaryBusy) {
+            militaryBusy = true;
+            planeThread.execute(this::fetchMilitary);
+        }
         if (busy) return;
         if (wantRegional) {
             boolean moved = AirData.nauticalMiles(lat, lon, lastLat, lastLon) > REFETCH_MOVED_NM;
@@ -126,6 +139,25 @@ final class AirFeed {
             if (showingWorld && now - file.lastModified() < WORLD_MS) return;
             busy = true;
             planeThread.execute(() -> fetchWorld(file));
+        }
+    }
+
+    /** Every military aircraft the network hears, worldwide, at every zoom. adsb.lol already gets the most from this app, so adsb.fi goes first. */
+    private void fetchMilitary() {
+        long now = System.currentTimeMillis();
+        try {
+            File file = new File(dir, "air-military.feed");
+            try {
+                Store.download(MILITARY_FI, file);
+            } catch (IOException first) {
+                Store.download(MILITARY_LOL, file);
+            }
+            military = AirData.parseRegional(Store.read(file), now);
+            militaryDue = now + MILITARY_MS;
+        } catch (Exception e) {
+            militaryDue = now + MILITARY_RETRY_MS;
+        } finally {
+            militaryBusy = false;
         }
     }
 
@@ -154,6 +186,7 @@ final class AirFeed {
             // A reopen within the same two minutes reuses the snapshot rather than spending credits on it.
             if (now - file.lastModified() >= WORLD_MS) Store.download(WORLD, file);
             List<AirData.Plane> parsed = AirData.parseOpenSky(Store.read(file), now);
+            estimates.update(parsed, now);
             if (!wantRegional) publish(parsed, "OpenSky world");
         } catch (IOException e) {
             if (String.valueOf(e.getMessage()).contains("429")) worldLimitedUntil = now + WORLD_LIMITED_MS;
@@ -168,7 +201,7 @@ final class AirFeed {
     }
 
     private void publish(List<AirData.Plane> parsed, String name) {
-        planes = parsed;
+        planes = AirData.merge(parsed, military, estimates.current);
         source = name;
         problem = "";
         updated = System.currentTimeMillis();

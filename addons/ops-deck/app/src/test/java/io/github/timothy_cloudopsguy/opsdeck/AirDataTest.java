@@ -145,19 +145,6 @@ public class AirDataTest {
     }
 
     @Test
-    public void nextEmergencyCyclesThroughThemThenStops() throws Exception {
-        List<AirData.Plane> planes = AirData.parseRegional("{\"ac\":["
-                + "{\"hex\":\"b\",\"lat\":1,\"lon\":1,\"squawk\":\"7700\"},"
-                + "{\"hex\":\"n\",\"lat\":1,\"lon\":1,\"squawk\":\"1200\"},"
-                + "{\"hex\":\"a\",\"lat\":1,\"lon\":1,\"squawk\":\"7600\"}]}", NOW);
-        assertEquals("a", AirData.nextEmergency(planes, "").hex);
-        assertEquals("b", AirData.nextEmergency(planes, "a").hex);
-        assertNull(AirData.nextEmergency(planes, "b"));
-        assertEquals("a", AirData.nextEmergency(planes, "").hex);
-        assertNull(AirData.nextEmergency(planes.subList(1, 2), ""));
-    }
-
-    @Test
     public void squawkSummaryNamesTheFirstAndCountsTheRest() throws Exception {
         List<AirData.Plane> planes = AirData.parseRegional("{\"ac\":["
                 + "{\"hex\":\"a\",\"flight\":\"HK1\",\"lat\":1,\"lon\":1,\"squawk\":\"7600\"},"

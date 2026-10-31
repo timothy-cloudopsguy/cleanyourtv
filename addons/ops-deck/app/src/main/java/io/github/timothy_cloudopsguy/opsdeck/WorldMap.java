@@ -60,4 +60,12 @@ final class WorldMap {
     };
 
     private WorldMap() {}
+
+    /** False over land, to the grid's three degrees; beyond the grid's north and south edges counts as water. */
+    static boolean isWater(double lat, double lon) {
+        int row = (int) Math.floor((TOP_LAT - lat) / (SPAN_LAT / ROWS));
+        if (row < 0 || row >= ROWS) return true;
+        int col = Math.floorMod((int) Math.floor((lon + 180) / (360.0 / COLS)), COLS);
+        return LAND[row].charAt(col) != '#';
+    }
 }

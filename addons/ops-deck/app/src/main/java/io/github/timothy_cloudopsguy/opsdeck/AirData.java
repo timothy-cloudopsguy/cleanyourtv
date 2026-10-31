@@ -5,7 +5,10 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Aircraft and the map's arithmetic, without Android so the tests can run it. Positions are "world" coordinates: Web
@@ -19,6 +22,12 @@ final class AirData {
     private static final double METRES_TO_FEET = 3.28084;
     private static final double MAX_LAT = 85.0;
     private static final long MAX_DRIFT_MS = 180_000;
+    /** Past this, an aircraft out of range could be far from a straight line, so it is no longer guessed at. */
+    private static final long ESTIMATE_MAX_MS = 90 * 60_000;
+    private static final int ESTIMATE_LIMIT = 1500;
+    private static final int CRUISE_MIN_FEET = 20_000;
+    private static final int CRUISE_MIN_KNOTS = 250;
+    private static final int DESCENDING_FPM = -800;
     private static final double STALE_SECONDS = 60;
     private static final long TRACK_MAX_AGE_MS = 30 * 60_000;
     private static final int MAX_TRACK_POINTS = 500;
@@ -42,10 +51,25 @@ final class AirData {
         final double velocityX;
         final double velocityY;
         final long timeMs;
+        final String category;
+        /** Which of Aircraft's shapes this is. */
+        final int kind;
+        /** No receiver has heard it since timeMs: this is where it should be, not where it was reported. */
+        final boolean estimated;
 
         Plane(String hex, String callsign, String type, String registration, boolean ground, int altitudeFeet,
                 int speedKnots, float track, int climbFpm, String squawk, boolean military,
-                double lat, double lon, long timeMs) {
+                double lat, double lon, long timeMs, String category) {
+            this(hex, callsign, type, registration, ground, altitudeFeet, speedKnots, track, climbFpm, squawk, military,
+                    lat, lon, timeMs, category, false);
+        }
+
+        private Plane(String hex, String callsign, String type, String registration, boolean ground, int altitudeFeet,
+                int speedKnots, float track, int climbFpm, String squawk, boolean military,
+                double lat, double lon, long timeMs, String category, boolean estimated) {
+            this.category = category;
+            this.kind = Aircraft.kind(type, category);
+            this.estimated = estimated;
             this.hex = hex;
             this.callsign = callsign;
             this.type = type;
@@ -77,7 +101,17 @@ final class AirData {
         }
 
         private double drift(long now) {
-            return Math.max(0, Math.min(MAX_DRIFT_MS, now - timeMs)) / 1000.0;
+            return Math.max(0, Math.min(estimated ? ESTIMATE_MAX_MS : MAX_DRIFT_MS, now - timeMs)) / 1000.0;
+        }
+
+        /** The same aircraft, flown on for longer. An old emergency code is dropped: it is not known to still apply. */
+        Plane asEstimate() {
+            return new Plane(hex, callsign, type, registration, false, altitudeFeet, speedKnots, track, climbFpm, "", military,
+                    lat(worldY), lon(worldX), timeMs, category, true);
+        }
+
+        boolean cruising() {
+            return !ground && altitudeFeet >= CRUISE_MIN_FEET && speedKnots >= CRUISE_MIN_KNOTS && climbFpm > DESCENDING_FPM;
         }
 
         boolean emergency() {
@@ -106,6 +140,59 @@ final class AirData {
             this.fromPoint = fromPoint;
             this.toPoint = toPoint;
         }
+    }
+
+    /** Answers whether a point is over open water. */
+    interface Water {
+        boolean at(double lat, double lon);
+    }
+
+    /**
+     * Aircraft past the reach of any receiver. No free feed hears them mid-ocean, so one that drops out of the world
+     * snapshot while cruising is flown on along its last track, for as long as that stays over water. Coming back into a
+     * snapshot, reaching land or running out of time ends the estimate.
+     */
+    static final class Estimates {
+        private final Water water;
+        private List<Plane> lastCruising = Collections.emptyList();
+        private int lastSize;
+        volatile List<Plane> current = Collections.emptyList();
+
+        Estimates(Water water) {
+            this.water = water;
+        }
+
+        synchronized void update(List<Plane> snapshot, long now) {
+            // A partial answer would look like thousands of aircraft vanishing at once.
+            if (snapshot.size() < lastSize / 2) return;
+            Set<String> heard = new HashSet<>();
+            for (Plane p : snapshot) heard.add(p.hex);
+            List<Plane> next = new ArrayList<>();
+            for (Plane p : current) keep(p, heard, now, next);
+            for (Plane p : lastCruising) keep(p.asEstimate(), heard, now, next);
+            List<Plane> cruising = new ArrayList<>();
+            for (Plane p : snapshot) if (p.cruising()) cruising.add(p);
+            lastCruising = cruising;
+            lastSize = snapshot.size();
+            current = next.size() > ESTIMATE_LIMIT ? new ArrayList<>(next.subList(0, ESTIMATE_LIMIT)) : next;
+        }
+
+        private void keep(Plane p, Set<String> heard, long now, List<Plane> out) {
+            if (now - p.timeMs > ESTIMATE_MAX_MS) return;
+            if (!water.at(lat(p.yAt(now)), lon(p.xAt(now)))) return;
+            // Also stops one aircraft being listed twice.
+            if (heard.add(p.hex)) out.add(p);
+        }
+    }
+
+    /** One list for the map: the military feed's report wins over a live one, and an estimate only fills a gap. */
+    static List<Plane> merge(List<Plane> live, List<Plane> military, List<Plane> estimates) {
+        Set<String> seen = new HashSet<>();
+        List<Plane> out = new ArrayList<>(live.size() + military.size() + estimates.size());
+        for (Plane p : military) if (seen.add(p.hex)) out.add(p);
+        for (Plane p : live) if (seen.add(p.hex)) out.add(p);
+        for (Plane p : estimates) if (seen.add(p.hex)) out.add(p);
+        return out;
     }
 
     /** The path a flight has flown so far, as world coordinates with the altitude at each point. */
@@ -193,13 +280,16 @@ final class AirData {
             if (!o.has("lat") || !o.has("lon")) continue;
             double seen = o.optDouble("seen_pos", 0);
             if (seen > STALE_SECONDS) continue;
+            String category = o.optString("category", "");
+            String type = o.optString("t", "");
+            if (Aircraft.notAnAircraft(type, category)) continue;
             Object altitude = o.opt("alt_baro");
             boolean ground = "ground".equals(altitude);
             int feet = altitude instanceof Number ? ((Number) altitude).intValue() : 0;
-            out.add(new Plane(o.optString("hex", ""), o.optString("flight", "").trim(), o.optString("t", ""),
+            out.add(new Plane(o.optString("hex", ""), o.optString("flight", "").trim(), type,
                     o.optString("r", ""), ground, feet, (int) o.optDouble("gs", 0), (float) o.optDouble("track", 0),
                     o.optInt("baro_rate", 0), o.optString("squawk", ""), (o.optInt("dbFlags", 0) & 1) != 0,
-                    o.getDouble("lat"), o.getDouble("lon"), now - (long) (seen * 1000)));
+                    o.getDouble("lat"), o.getDouble("lon"), now - (long) (seen * 1000), category));
         }
         return out;
     }
@@ -221,7 +311,7 @@ final class AirData {
             out.add(new Plane(s.optString(0, ""), s.isNull(1) ? "" : s.optString(1, "").trim(), "", "", false,
                     (int) (metres * METRES_TO_FEET), (int) (s.optDouble(9, 0) * MS_TO_KNOTS),
                     (float) s.optDouble(10, 0), (int) (s.optDouble(11, 0) * METRES_TO_FEET * 60),
-                    s.isNull(14) ? "" : s.optString(14, ""), false, s.getDouble(6), s.getDouble(5), reported));
+                    s.isNull(14) ? "" : s.optString(14, ""), false, s.getDouble(6), s.getDouble(5), reported, ""));
         }
         return out;
     }
@@ -318,16 +408,144 @@ final class AirData {
         return emergencies.size() == 1 ? line : line + ", and " + (emergencies.size() - 1) + " more";
     }
 
-    /** The emergency after the one selected, in a stable order; null past the last one, or when there are none. */
-    static Plane nextEmergency(List<Plane> planes, String currentHex) {
+    /** The next aircraft worth jumping to: emergencies, then military, each in a stable order, going round; null when none. */
+    static Plane nextPriority(List<Plane> planes, String currentHex) {
+        String current = "";
+        for (Plane p : planes) {
+            if (p.hex.equals(currentHex) && (p.emergency() || p.military)) current = priorityKey(p);
+        }
         Plane first = null;
         Plane next = null;
         for (Plane p : planes) {
-            if (!p.emergency()) continue;
-            if (first == null || p.hex.compareTo(first.hex) < 0) first = p;
-            if (p.hex.compareTo(currentHex) > 0 && (next == null || p.hex.compareTo(next.hex) < 0)) next = p;
+            if (!p.emergency() && !p.military) continue;
+            String key = priorityKey(p);
+            if (first == null || key.compareTo(priorityKey(first)) < 0) first = p;
+            if (key.compareTo(current) > 0 && (next == null || key.compareTo(priorityKey(next)) < 0)) next = p;
         }
-        return currentHex.isEmpty() ? first : next;
+        return next != null ? next : first;
+    }
+
+    private static String priorityKey(Plane p) {
+        return (p.emergency() ? "0" : "1") + p.hex;
+    }
+
+    static Plane find(List<Plane> planes, String hex) {
+        for (int i = 0; i < planes.size(); i++) if (planes.get(i).hex.equals(hex)) return planes.get(i);
+        return null;
+    }
+
+    /** Where the map's camera is, for working out what can be picked and where it is on screen. */
+    static final class PickView {
+        private static final float EDGE_MARGIN = 20;
+        final double centerX;
+        final double centerY;
+        final double world;
+        final float left;
+        final float top;
+        final float right;
+        final float bottom;
+        /** Too many aircraft to draw as shapes: only emergencies and military, which still are, can be picked. */
+        final boolean shapesOnly;
+        /** Screen rectangles under the HUD and cards, each left, top, right, bottom. */
+        final float[][] covered;
+
+        PickView(double centerX, double centerY, double world, float left, float top, float right, float bottom, boolean shapesOnly, float[][] covered) {
+            this.centerX = centerX;
+            this.centerY = centerY;
+            this.world = world;
+            this.left = left;
+            this.top = top;
+            this.right = right;
+            this.bottom = bottom;
+            this.shapesOnly = shapesOnly;
+            this.covered = covered;
+        }
+
+        float x(Plane p, long now) {
+            return (float) ((left + right) / 2 + wrapDelta(p.xAt(now) - centerX) * world);
+        }
+
+        float y(Plane p, long now) {
+            return (float) ((top + bottom) / 2 + (p.yAt(now) - centerY) * world);
+        }
+
+        boolean eligible(Plane p, long now) {
+            if (p.ground || (shapesOnly && !p.emergency() && !p.military)) return false;
+            float x = x(p, now);
+            float y = y(p, now);
+            if (x < left + EDGE_MARGIN || x > right - EDGE_MARGIN || y < top + EDGE_MARGIN || y > bottom - EDGE_MARGIN) return false;
+            for (float[] box : covered) {
+                if (x >= box[0] && x <= box[2] && y >= box[1] && y <= box[3]) return false;
+            }
+            return true;
+        }
+    }
+
+    private static final float HOP_MIN = 6;
+    private static final float HOP_CONE = 1.2f;
+    private static final float HOP_OFF_AXIS_COST = 2;
+    private static final float PRIORITY_DISCOUNT = 0.6f;
+    private static final float OVERLAP_PX = 6;
+
+    private static float weight(Plane p) {
+        return p.emergency() || p.military ? PRIORITY_DISCOUNT : 1;
+    }
+
+    /** The aircraft to highlight first: nearest the middle of the map, leaning toward emergencies and military. */
+    static Plane pickStart(List<Plane> planes, PickView view, long now) {
+        float mx = (view.left + view.right) / 2;
+        float my = (view.top + view.bottom) / 2;
+        Plane best = null;
+        float bestCost = Float.MAX_VALUE;
+        for (Plane p : planes) {
+            if (!view.eligible(p, now)) continue;
+            float cost = (float) Math.hypot(view.x(p, now) - mx, view.y(p, now) - my) * weight(p);
+            if (best == null || cost < bestCost || (cost == bestCost && p.hex.compareTo(best.hex) < 0)) {
+                best = p;
+                bestCost = cost;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The aircraft one arrow press away: the cheapest in a cone about that direction, where being off to the side costs
+     * twice as much as being far. With nothing that way, aircraft stacked on this one take turns, so none is out of reach.
+     * Null when there is nothing to go to.
+     */
+    static Plane hop(List<Plane> planes, Plane from, int dx, int dy, PickView view, long now) {
+        float fromX = view.x(from, now);
+        float fromY = view.y(from, now);
+        Plane best = null;
+        float bestCost = Float.MAX_VALUE;
+        Plane stackedNext = null;
+        Plane stackedWrap = null;
+        boolean forward = dx > 0 || dy > 0;
+        for (Plane p : planes) {
+            if (p.hex.equals(from.hex) || !view.eligible(p, now)) continue;
+            float ox = view.x(p, now) - fromX;
+            float oy = view.y(p, now) - fromY;
+            float along = ox * dx + oy * dy;
+            float across = Math.abs(ox * dy - oy * dx);
+            if (along >= HOP_MIN && across <= HOP_CONE * along) {
+                float cost = (along + HOP_OFF_AXIS_COST * across) * weight(p);
+                if (best == null || cost < bestCost || (cost == bestCost && p.hex.compareTo(best.hex) < 0)) {
+                    best = p;
+                    bestCost = cost;
+                }
+            }
+            if (Math.hypot(ox, oy) <= OVERLAP_PX) {
+                int order = forward ? p.hex.compareTo(from.hex) : from.hex.compareTo(p.hex);
+                if (order > 0 && (stackedNext == null || closer(p, stackedNext, forward))) stackedNext = p;
+                if (order < 0 && (stackedWrap == null || closer(p, stackedWrap, forward))) stackedWrap = p;
+            }
+        }
+        if (best != null) return best;
+        return stackedNext != null ? stackedNext : stackedWrap;
+    }
+
+    private static boolean closer(Plane a, Plane b, boolean forward) {
+        return forward ? a.hex.compareTo(b.hex) < 0 : a.hex.compareTo(b.hex) > 0;
     }
 
     private static String place(JSONObject airport) {
