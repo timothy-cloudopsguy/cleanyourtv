@@ -471,7 +471,7 @@ final class AirPanel extends Panel {
             points[used + 1] = y;
             dotCount[bucket] = used + 2;
         }
-        for (AirData.Plane p : feed.worldEmergencies) {
+        for (AirData.Plane p : deck.store.emergencies) {
             boolean known = false;
             for (int i = 0; i < alarms.size() && !known; i++) known = alarms.get(i).hex.equals(p.hex);
             if (!known && p.emergency()) alarms.add(p);
@@ -595,7 +595,7 @@ final class AirPanel extends Panel {
         Ui.bold(c, p.name(), l + 22, t + 54, 42, p.emergency() ? Ui.RED : Ui.TEXT);
         float y = t + 90;
         if (p.emergency()) {
-            Ui.bold(c, "SQUAWK " + p.squawk + " " + squawkWord(p.squawk), l + 22, y, 23, Ui.RED);
+            Ui.bold(c, "SQUAWK " + p.squawk + " " + AirData.squawkMeaning(p.squawk).toUpperCase(Locale.ROOT), l + 22, y, 23, Ui.RED);
             y += 34;
         }
         if (!p.emergency() && !reportedSquawk.isEmpty() && !reportedSquawk.equals(p.squawk)) {
@@ -656,14 +656,6 @@ final class AirPanel extends Panel {
     private static String climbWord(int fpm) {
         if (fpm > 300) return "climbing";
         return fpm < -300 ? "descending" : "";
-    }
-
-    private static String squawkWord(String squawk) {
-        switch (squawk) {
-            case "7500": return "HIJACK";
-            case "7600": return "RADIO FAILURE";
-            default: return "EMERGENCY";
-        }
     }
 
     private void drawControls(Canvas c) {

@@ -158,6 +158,19 @@ public class AirDataTest {
     }
 
     @Test
+    public void squawkSummaryNamesTheFirstAndCountsTheRest() throws Exception {
+        List<AirData.Plane> planes = AirData.parseRegional("{\"ac\":["
+                + "{\"hex\":\"a\",\"flight\":\"HK1\",\"lat\":1,\"lon\":1,\"squawk\":\"7600\"},"
+                + "{\"hex\":\"b\",\"lat\":1,\"lon\":1,\"squawk\":\"7700\"},"
+                + "{\"hex\":\"c\",\"lat\":1,\"lon\":1,\"squawk\":\"7500\"}]}", NOW);
+        assertEquals("No emergency squawks", AirData.squawkSummary(planes.subList(0, 0)));
+        assertEquals("7600 radio failure: HK1", AirData.squawkSummary(planes.subList(0, 1)));
+        assertEquals("7600 radio failure: HK1, and 2 more", AirData.squawkSummary(planes));
+        assertEquals("hijack", AirData.squawkMeaning("7500"));
+        assertEquals("emergency", AirData.squawkMeaning("7700"));
+    }
+
+    @Test
     public void routeAndLocationAnswers() throws Exception {
         AirData.Route route = AirData.parseRoute("{\"response\":{\"flightroute\":{\"airline\":{\"name\":\"United\"},"
                 + "\"origin\":{\"iata_code\":\"EWR\",\"municipality\":\"Newark\",\"latitude\":40.6,\"longitude\":-74.1},"

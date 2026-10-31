@@ -302,6 +302,22 @@ final class AirData {
         return out;
     }
 
+    static String squawkMeaning(String squawk) {
+        switch (squawk) {
+            case "7500": return "hijack";
+            case "7600": return "radio failure";
+            default: return "emergency";
+        }
+    }
+
+    /** One line for the Bridge: the first emergency and how many more. */
+    static String squawkSummary(List<Plane> emergencies) {
+        if (emergencies.isEmpty()) return "No emergency squawks";
+        Plane first = emergencies.get(0);
+        String line = first.squawk + " " + squawkMeaning(first.squawk) + ": " + first.name();
+        return emergencies.size() == 1 ? line : line + ", and " + (emergencies.size() - 1) + " more";
+    }
+
     /** The emergency after the one selected, in a stable order; null past the last one, or when there are none. */
     static Plane nextEmergency(List<Plane> planes, String currentHex) {
         Plane first = null;

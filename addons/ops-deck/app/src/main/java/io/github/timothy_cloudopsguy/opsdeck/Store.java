@@ -41,6 +41,7 @@ final class Store {
     static final int TECH = 1;
     static final int SCIENCE = 2;
     static final int HISTORY = 3;
+    static final String[] EMERGENCY_CODES = {"7700", "7600", "7500"};
     static final String[] CATEGORIES = {"VULNS", "TECH", "SCIENCE", "HISTORY"};
 
     /** One vendor's status page. */
@@ -147,6 +148,12 @@ final class Store {
     volatile List<Parsers.Repo> repos;
     volatile int[] weeks;
     volatile int kevTotal = -1;
+    /** Aircraft in the air in OpenSky's last world snapshot; -1 until there is one. */
+    volatile int flightsUp = -1;
+    /** Emergency squawks anywhere in the world, across the codes in EMERGENCY_CODES. */
+    volatile List<AirData.Plane> emergencies = Collections.emptyList();
+    @SuppressWarnings("unchecked")
+    private final List<AirData.Plane>[] emergenciesByCode = new List[EMERGENCY_CODES.length];
     /** Which of the last ISS fixes to draw as a trail: lat, lon pairs, oldest first. */
     final List<double[]> issTrail = Collections.synchronizedList(new ArrayList<>());
 
@@ -193,6 +200,16 @@ final class Store {
             issTrail.add(new double[]{now.lat, now.lon});
             if (issTrail.size() > 60) issTrail.remove(0);
         }));
+        // OpenSky allows 400 credits a day and a world snapshot costs 4: at this pace a TV left on all day stays well
+        // inside that, with room for the air map's own use.
+        jobs.add(new Job("OpenSky count", "https://opensky-network.org/api/states/all", 20 * MINUTE,
+                (f, ms) -> flightsUp = AirData.parseOpenSky(read(f), System.currentTimeMillis()).size()));
+        for (int i = 0; i < EMERGENCY_CODES.length; i++) {
+            int code = i;
+            emergenciesByCode[i] = Collections.emptyList();
+            jobs.add(new Job("Squawk " + EMERGENCY_CODES[i], "https://api.adsb.lol/v2/sqk/" + EMERGENCY_CODES[i], MINUTE,
+                    (f, ms) -> setEmergencies(code, AirData.parseRegional(read(f), System.currentTimeMillis()))));
+        }
         jobs.add(new Job("GitHub chart", "https://github.com/users/" + githubUser + "/contributions",
                 HOUR, (f, ms) -> calendar = Parsers.calendar(read(f))));
         // Unauthenticated GitHub allows 60 calls an hour, so these stay slow.
@@ -231,6 +248,13 @@ final class Store {
                 return;
             }
         }
+    }
+
+    private synchronized void setEmergencies(int code, List<AirData.Plane> found) {
+        emergenciesByCode[code] = found;
+        List<AirData.Plane> all = new ArrayList<>();
+        for (List<AirData.Plane> list : emergenciesByCode) all.addAll(list);
+        emergencies = all;
     }
 
     private void addStatus(String name, String base) {

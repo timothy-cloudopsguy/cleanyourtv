@@ -8,7 +8,7 @@ it, and Back or Left comes out again.
 
 | Screen | What is on it |
 |---|---|
-| Bridge | Eight summary tiles (OK opens the screen behind each), a headline ticker and the TV apps. Each app has its own note on a pentatonic scale, so scrolling the row plays a little tune; OK opens the app |
+| Bridge | Eight summary tiles (OK opens the screen behind each), including flights in the air and any emergency squawk, a headline ticker and the TV apps. Each app has its own note on a pentatonic scale, so scrolling the row plays a little tune; OK opens the app |
 | Intel | Four desks. Vulns: CISA's known exploited list, The Hacker News, Krebs on Security. Tech: Hacker News, Ars Technica. Science: Quanta, NASA, ScienceDaily. History: Wikipedia's On This Day, Smithsonian. Each story has its summary and a QR code for your phone; OK reads it here in a small built-in browser |
 | Status | GitHub, Cloudflare, Claude, OpenAI and Discord: status, response time from this TV as a trace, open incidents, degraded components |
 | Planet | A dot-matrix world with the last day's M4.5+ earthquakes and the ISS with its trail; the planetary K index |
@@ -36,9 +36,9 @@ it, and Back or Left comes out again.
 - A `<queries>` entry for TV launcher activities, not a permission: it lists the apps for the Bridge's row.
 
 The air map fetches only while it is on screen: adsb.lol or adsb.fi for live traffic around the map's centre, OpenSky for
-the zoomed-out world view (every two minutes, within its free limit of 400 credits a day), adsbdb for a selected flight's
+the zoomed-out world view (every two minutes, within its free limit of 400 credits a day) and the Bridge's flight count (every 20 minutes while the app is open), adsbdb for a selected flight's
 route, OpenSky for its flown path and OpenStreetMap for map tiles (kept in the app's cache so each is fetched once). To find where to start, ipwho.is works out a rough location
-from the TV's internet address; only the latitude and longitude are kept, on the TV. adsb.lol is also asked each minute for emergency squawks worldwide. Those services receive the map
+from the TV's internet address; only the latitude and longitude are kept, on the TV. adsb.lol is also asked each minute while the app is open for emergency squawks worldwide. Those services receive the map
 area or flight being looked at. The map shows what volunteer and research receivers hear, so it is not every flight, and
 it is for fun, not for navigation or safety.
 

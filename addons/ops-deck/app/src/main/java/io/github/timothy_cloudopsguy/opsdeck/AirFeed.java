@@ -42,9 +42,6 @@ final class AirFeed {
     private static final String REGIONAL_LOL = "https://api.adsb.lol/v2/lat/%.3f/lon/%.3f/dist/%d";
     private static final String REGIONAL_FI = "https://opendata.adsb.fi/api/v2/lat/%.3f/lon/%.3f/dist/%d";
     private static final String WORLD = "https://opensky-network.org/api/states/all";
-    private static final String SQUAWK = "https://api.adsb.lol/v2/sqk/";
-    private static final String[] EMERGENCY_CODES = {"7700", "7600", "7500"};
-    private static final long EMERGENCY_MS = 60_000;
     private static final String TRACK = "https://opensky-network.org/api/tracks/all?time=0&icao24=";
     private static final long TRACK_REFRESH_MS = 5 * 60_000;
     private static final String ROUTE = "https://api.adsbdb.com/v0/callsign/";
@@ -59,9 +56,6 @@ final class AirFeed {
     /** Set once: {lat, lon}. */
     volatile double[] home;
     volatile boolean locating = true;
-    /** Emergencies anywhere in the world, whatever part of it the map is showing. */
-    volatile List<AirData.Plane> worldEmergencies = Collections.emptyList();
-    private long emergenciesAsked;
     volatile AirData.Track currentTrack;
     volatile String trackState = "";
     private volatile String trackHex = "";
@@ -111,10 +105,6 @@ final class AirFeed {
     /** Called each frame: asks for fresh aircraft when they are due for what the screen shows. */
     void poll(double lat, double lon, int zoom, long now) {
         locateOnce(now);
-        if (now - emergenciesAsked >= EMERGENCY_MS) {
-            emergenciesAsked = now;
-            planeThread.execute(this::fetchEmergencies);
-        }
         wantRegional = zoom >= REGIONAL_MIN_ZOOM;
         if (busy) return;
         if (wantRegional) {
@@ -136,20 +126,6 @@ final class AirFeed {
             if (showingWorld && now - file.lastModified() < WORLD_MS) return;
             busy = true;
             planeThread.execute(() -> fetchWorld(file));
-        }
-    }
-
-    private void fetchEmergencies() {
-        List<AirData.Plane> found = new java.util.ArrayList<>();
-        try {
-            File file = new File(dir, "air-squawk.feed");
-            for (String code : EMERGENCY_CODES) {
-                Store.download(SQUAWK + code, file);
-                found.addAll(AirData.parseRegional(Store.read(file), System.currentTimeMillis()));
-            }
-            worldEmergencies = found;
-        } catch (Exception e) {
-            // Keep the last answer: the feeds on screen still show the emergencies they carry.
         }
     }
 
