@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Whose contribution chart and repositories the Git screen shows. -->
+    <string name="github_user" translatable="false">timothy-cloudopsguy</string>
+    <!-- owner/name: a public repository whose weekly commits are charted under them. -->
+    <string name="github_watch_repo" translatable="false">Gathin23/cleanyourtv</string>
+    <!-- Where the air map starts. Empty: a rough guess from the TV's internet address. Set both to skip that lookup. -->
+    <string name="home_lat" translatable="false"></string>
+    <string name="home_lon" translatable="false"></string>
+</resources>

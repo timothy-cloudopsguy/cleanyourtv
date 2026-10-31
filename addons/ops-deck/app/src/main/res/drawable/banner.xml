@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 320x180, as Android TV banners are: a pulse line across a dark console. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path android:fillColor="#FF070B14" android:pathData="M0,0h320v180h-320z" />
+    <path android:fillColor="#FF16233A" android:pathData="M0,44h320v2h-320zM0,90h320v2h-320zM0,136h320v2h-320zM80,0h2v180h-2zM160,0h2v180h-2zM240,0h2v180h-2z" />
+    <path android:strokeColor="#FF22E6C3" android:strokeWidth="7" android:strokeLineJoin="round"
+        android:pathData="M28,92h66l16,-48l26,96l26,-70l14,22h114" />
+    <path android:fillColor="#FFFF4D6D" android:pathData="M292,80a12,12 0 1,0 0.1,0z" />
+</vector>
