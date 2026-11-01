@@ -27,6 +27,7 @@ final class BridgePanel extends Panel {
     private static final float APP_TOP = 806f;
     private static final double TICKER_SPEED = 0.09;
 
+    private static final String ON_THIS_DAY = "On this day ";
     private final String[] label = {"SERVICES", "EXPLOITED CVES", "ON THIS DAY", "QUAKES M4.5+", "SPACE", "AIR TRAFFIC", "GIT", "HIGH SCORE"};
     private final int[] target = {2, 1, 1, 3, 3, 5, 6, 8};
     private final String[] value = new String[TILES];
@@ -205,14 +206,13 @@ final class BridgePanel extends Panel {
         }
         if (s.kevTotal >= 0) {
             value[1] = Ui.number(s.kevTotal);
-            List<Headline> vulns = s.headlines(Store.VULNS);
-            sub[1] = vulns.isEmpty() ? "CISA known exploited list" : vulns.get(0).title;
+            Headline exploited = Parsers.firstFrom(s.headlines(Store.VULNS), "CISA KEV");
+            sub[1] = exploited == null ? "CISA known exploited list" : exploited.title;
             tone[1] = Ui.RED;
         }
-        List<Headline> history = s.headlines(Store.HISTORY);
-        if (!history.isEmpty()) {
-            Headline h = history.get(0);
-            value[2] = h.source.startsWith("On this day ") ? h.source.substring(12) : h.source;
+        Headline h = Parsers.firstFrom(s.headlines(Store.HISTORY), ON_THIS_DAY);
+        if (h != null) {
+            value[2] = h.source.substring(ON_THIS_DAY.length());
             sub[2] = h.title;
             tone[2] = Ui.MAGENTA;
         }

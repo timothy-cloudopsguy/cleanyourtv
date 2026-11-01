@@ -125,15 +125,17 @@ final class SystemPanel extends Panel {
         Ui.card(c, l, DeckView.Y0, r, DeckView.Y1, Ui.PANEL);
         Ui.heading(c, "FEED HEALTH", l + 24, DeckView.Y0 + 42);
         List<Store.Job> jobs = deck.store.jobs;
-        for (int i = 0; i < Math.min(FEED_ROWS, jobs.size()); i++) {
+        float columnW = (r - l - 24) / 2;
+        for (int i = 0; i < Math.min(FEED_ROWS * 2, jobs.size()); i++) {
             Store.Job job = jobs.get(i);
-            float y = DeckView.Y0 + 72 + i * 26.5f;
+            float y = DeckView.Y0 + 72 + (i % FEED_ROWS) * 26.5f;
+            float left = l + (i / FEED_ROWS) * columnW;
             int color = !job.error.isEmpty() ? Ui.RED : job.lastGood > 0 ? Ui.GREEN : Ui.FAINT;
             Ui.FILL.setColor(color);
-            c.drawCircle(l + 32, y - 7, 7, Ui.FILL);
-            Ui.line(c, job.name, l + 52, y, 370, 22, Ui.TEXT, Ui.MONO);
+            c.drawCircle(left + 32, y - 7, 7, Ui.FILL);
+            Ui.line(c, job.name, left + 52, y, columnW - 150, 19, Ui.TEXT, Ui.MONO);
             String state = !job.error.isEmpty() ? job.error : job.lastGood > 0 ? Parsers.ago(job.lastGood, now) + " ago" : "waiting";
-            Ui.right(c, state, r - 24, y, 21, color == Ui.GREEN ? Ui.DIM : color);
+            Ui.right(c, state, left + columnW - 4, y, 18, color == Ui.GREEN ? Ui.DIM : color);
         }
     }
 

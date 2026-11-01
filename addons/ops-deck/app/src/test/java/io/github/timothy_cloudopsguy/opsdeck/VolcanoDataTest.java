@@ -93,4 +93,18 @@ public class VolcanoDataTest {
         assertEquals(Arrays.asList("F1cam", "KWcam"), VolcanoData.readWall("F1cam,gone,F1cam,KWcam,MLcam", 2));
         assertTrue(VolcanoData.readWall("", 6).isEmpty());
     }
+
+    @Test
+    public void everySpotterStreamIsUniqueAllowedAndItsStartingWallIsReal() {
+        Set<String> ids = new HashSet<>();
+        for (VolcanoData.Cam cam : AirData.SPOTTER_CAMS) {
+            assertTrue(cam.id, ids.add(cam.id));
+            assertTrue(cam.id, cam.video());
+            assertTrue(cam.id, cam.poster);
+            assertTrue(cam.id, ReaderActivity.allowed(cam.videoUrl));
+            assertTrue(cam.id, ReaderActivity.allowed(cam.channelUrl));
+        }
+        assertEquals(6, VolcanoData.readWall(AirData.SPOTTER_CAMS, AirData.SPOTTER_START_WALL, 6).size());
+        assertTrue("the two lists do not mix", VolcanoData.readWall(AirData.SPOTTER_CAMS, "F1cam", 6).isEmpty());
+    }
 }

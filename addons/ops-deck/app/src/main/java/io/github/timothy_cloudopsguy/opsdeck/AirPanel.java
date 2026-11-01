@@ -87,7 +87,14 @@ final class AirPanel extends Panel {
             {R - 470, T + 14, R, B},
     };
 
+    private static final int VIEW_MAP = 0;
+    private static final int VIEW_CAMS = 1;
+    private static final int VIEW_WALL = 2;
+    private static final String[] VIEW_NAMES = {"MAP", "CAMS", "WALL"};
+
     private final AirFeed feed;
+    private final CamBoard board;
+    private int view = VIEW_MAP;
     private final Paint tilePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final RectF dest = new RectF();
     // Rotating a filled path costs far more per frame than a bitmap, and hundreds are drawn: each outline is drawn once
@@ -172,6 +179,7 @@ final class AirPanel extends Panel {
         super(deck);
         feed = new AirFeed(context, deck.prefs, deck.store.estimates, context.getString(io.github.timothy_cloudopsguy.opsdeck.R.string.home_lat),
                 context.getString(io.github.timothy_cloudopsguy.opsdeck.R.string.home_lon));
+        board = new CamBoard(deck, context, AirData.SPOTTER_CAMS, "spotter_wall", AirData.SPOTTER_START_WALL, Ui.BLUE);
         for (int i = 0; i < dots.length; i++) dots[i] = new float[4096];
         tilePaint.setColorFilter(new ColorMatrixColorFilter(darkMap()));
         for (int kind = 0; kind < solid.length; kind++) {
@@ -237,6 +245,7 @@ final class AirPanel extends Panel {
 
     @Override
     boolean key(int key) {
+        if (view != VIEW_MAP) return camsKey(key);
         if (key == KeyEvent.KEYCODE_CHANNEL_UP || key == KeyEvent.KEYCODE_PAGE_UP || key == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) {
             zoomBy(1);
             recentreTarget();
@@ -293,6 +302,11 @@ final class AirPanel extends Panel {
                 deck.sfx.confirm();
                 return true;
             case KeyEvent.KEYCODE_DPAD_UP:
+                moreMenu = false;
+                controls = false;
+                view = VIEW_CAMS;
+                deck.sfx.confirm();
+                return true;
             case KeyEvent.KEYCODE_DPAD_DOWN:
                 return true;
             default:
@@ -303,6 +317,23 @@ final class AirPanel extends Panel {
                 }
                 return false;
         }
+    }
+
+    /** The spotter cameras' tabs: Left and Right walk from the map to the cameras to the wall. */
+    private boolean camsKey(int key) {
+        if (board.overlayKey(key)) return true;
+        if (view == VIEW_CAMS) {
+            if (key == KeyEvent.KEYCODE_DPAD_LEFT) return moveView(VIEW_MAP);
+            if (key == KeyEvent.KEYCODE_DPAD_RIGHT) return moveView(VIEW_WALL);
+            return board.camsKey(key);
+        }
+        return board.wallKey(key) || (key == KeyEvent.KEYCODE_DPAD_LEFT && moveView(VIEW_CAMS));
+    }
+
+    private boolean moveView(int next) {
+        view = next;
+        deck.sfx.tick();
+        return true;
     }
 
     private boolean controlKey(int key) {
@@ -442,6 +473,10 @@ final class AirPanel extends Panel {
 
     @Override
     boolean back() {
+        if (view != VIEW_MAP) {
+            if (!board.back()) view = VIEW_MAP;
+            return true;
+        }
         if (moreMenu) {
             moreMenu = false;
             return true;
@@ -559,8 +594,8 @@ final class AirPanel extends Panel {
         AirData.RouteSet set = feed.routes(selected.callsign);
         if (set == null) return null;
         routeCheckVersion = feed.version;
-        routeCheck = AirData.checkRoute(set.legs, AirData.lat(selected.yAt(now)), AirData.lon(selected.xAt(now)), selected.track);
-        routeSettled = routeCheck.trusted();
+        routeCheck = AirData.checkRoute(set.legs, AirData.lat(selected.yAt(now)), AirData.lon(selected.xAt(now)), selected.track, selected.climbFpm);
+        routeSettled = routeCheck.trusted() && routeCheck.sure;
         toGoFor = "";
         return routeCheck;
     }
@@ -570,7 +605,37 @@ final class AirPanel extends Panel {
     }
 
     @Override
+    void onLeave() {
+        board.stop();
+    }
+
+    private void drawCamsView(Canvas c, long now) {
+        board.focused = focused;
+        board.sync(view == VIEW_WALL);
+        if (board.showingFullScreen()) {
+            board.drawLarge(c, now);
+            return;
+        }
+        float x = L;
+        for (int i = 0; i < VIEW_NAMES.length; i++) {
+            boolean on = i == view;
+            Ui.card(c, x, 118, x + 200, 170, on ? Ui.BLUE : Ui.PANEL);
+            Ui.centre(c, i == VIEW_WALL ? "WALL " + board.wallSize() : VIEW_NAMES[i], x + 100, 154, 25, on ? Ui.BG : Ui.DIM);
+            x += 212;
+        }
+        if (view == VIEW_CAMS) board.drawCams(c, now);
+        else board.drawWall(c, now);
+        board.drawOverlays(c, now);
+    }
+
+    @Override
     void draw(Canvas c, long now) {
+        if (view != VIEW_MAP) {
+            drawCamsView(c, now);
+            return;
+        }
+        // Leaving the wall for the map must stop its video too.
+        if (!deck.liveKey.isEmpty()) board.stop();
         settleHome();
         trackSelected(now);
         trackTarget(now);
@@ -1389,6 +1454,8 @@ final class AirPanel extends Panel {
         c.drawRoundRect(dest, 10, 10, Ui.STROKE);
         if (moreMenu) {
             Ui.centre(c, "MORE", MX, t + 52, 30, Ui.BLUE);
+            Ui.centre(c, "UP", MX, t + 120, 30, Ui.TEXT);
+            Ui.centre(c, "LIVE AIRPORT CAMS", MX, t + 152, 22, Ui.BLUE);
             Ui.centre(c, "LEFT", l + 170, t + 190, 30, Ui.TEXT);
             Ui.centre(c, "HOME", l + 170, t + 222, 22, Ui.DIM);
             Ui.centre(c, "RIGHT", l + w - 200, t + 190, 30, Ui.TEXT);
@@ -1400,7 +1467,7 @@ final class AirPanel extends Panel {
         Ui.centre(c, "UP", MX, t + 120, 30, Ui.TEXT);
         Ui.centre(c, "ZOOM IN", MX, t + 152, 22, Ui.DIM);
         Ui.centre(c, "LEFT", l + 120, t + 210, 30, Ui.TEXT);
-        Ui.centre(c, "HOME, FILTER", l + 120, t + 242, 22, Ui.DIM);
+        Ui.centre(c, "HOME, FILTER, CAMS", l + 130, t + 242, 22, Ui.DIM);
         Ui.centre(c, "RIGHT", l + w - 130, t + 210, 30, Ui.TEXT);
         boolean anyEmergency = emergencies > 0;
         boolean anyMilitary = false;

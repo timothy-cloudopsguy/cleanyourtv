@@ -161,6 +161,26 @@ final class AirData {
         }
     }
 
+    private static final String FR24 = "https://www.youtube.com/@Flightradar24DotCom/streams";
+    private static final String AIRLINE_VIDEOS = "https://www.youtube.com/@AirlineVideosLivePlus/streams";
+
+    /** Plane spotters' live streams. Each was checked live and allowed to embed on 1 Nov 2026; streams that end each day are left out. */
+    static final VolcanoData.Cam[] SPOTTER_CAMS = {
+            VolcanoData.stream("n4I0d44oBEs", "Los Angeles LAX", "Runways 24L and 24R", "AirlineVideosLive+", AIRLINE_VIDEOS),
+            VolcanoData.stream("KzsNnyN8D_Q", "Los Angeles LAX", "Runways 25L and 25R", "AirlineVideosLive+", AIRLINE_VIDEOS),
+            VolcanoData.stream("uDBYuEV4zjI", "London Heathrow", "BIG JET TV", "BIG JET TV", "https://www.youtube.com/@BigJetTV/streams"),
+            VolcanoData.stream("SgvpyjQX_HM", "London Heathrow", "Flightradar24 camera", "Flightradar24", FR24),
+            VolcanoData.stream("T_QsY01tIK0", "New York LaGuardia", "Flightradar24 camera", "Flightradar24", FR24),
+            VolcanoData.stream("V7_orOtu-oo", "Las Vegas", "Runways 26L and 26R", "Flightradar24", FR24),
+            VolcanoData.stream("2IQmpCXbOmM", "St Maarten SXM", "Maho Beach", "Flightradar24", FR24),
+            VolcanoData.stream("iSeH45R-8R0", "St Maarten SXM", "Maho Beach, with the crowd", "SHOWME Caribbean", "https://www.youtube.com/@SHOWMECaribbean/streams"),
+            VolcanoData.stream("_GUsXnlVJmo", "Miami", "Runway 9/27 with tower radio", "PTZtv", "https://www.youtube.com/@PTZtv/streams"),
+            VolcanoData.stream("q2Dxx5704fQ", "Miami", "From the Embassy Suites", "Ozolio Live", "https://www.youtube.com/@ozolio_live/streams"),
+            VolcanoData.stream("EiUyBIcG4fQ", "Chicago Midway", "EarthCam", "EarthCam", "https://www.youtube.com/@earthcam/streams"),
+            VolcanoData.stream("46VybvVqUKw", "Atlanta", "Tower and runway view", "Southern Radar", "https://www.youtube.com/@southernradar/streams"),
+    };
+    static final String SPOTTER_START_WALL = "n4I0d44oBEs,uDBYuEV4zjI,2IQmpCXbOmM,T_QsY01tIK0,_GUsXnlVJmo,46VybvVqUKw";
+
     /** Answers whether a point is over open water. */
     interface Water {
         boolean at(double lat, double lon);
@@ -238,10 +258,17 @@ final class AirData {
         /** Null when nothing fits. */
         final Route route;
         final int state;
+        /** False when this is only the best guess so far, and worth trying again as the flight goes on. */
+        final boolean sure;
 
         RouteCheck(Route route, int state) {
+            this(route, state, true);
+        }
+
+        RouteCheck(Route route, int state, boolean sure) {
             this.route = route;
             this.state = state;
+            this.sure = sure;
         }
 
         /** Good enough to work out a distance and landing time from. */
@@ -252,13 +279,17 @@ final class AirData {
 
     private static final double ROUTE_DETOUR = 1.25;
     private static final double ROUTE_SLACK_NM = 60;
-    /** Near an airport an aircraft can be pointing any way, so its heading says nothing. */
+    /** Near an airport an aircraft can be pointing any way, so climbing or descending says more than its heading. */
     private static final double NEAR_AIRPORT_NM = 60;
+    private static final int VERTICAL_FPM = 300;
+    /** Closer than this and level, as in a holding pattern or the circuit, nothing about it says which way it is going. */
+    private static final double AT_AIRPORT_NM = 15;
     private static final double HEADING_TOLERANCE = 70;
 
     /** Looked-up routes go by flight number alone, and are often wrong or backward: this tests each against the aircraft. */
-    static RouteCheck checkRoute(List<Route> legs, double lat, double lon, double track) {
+    static RouteCheck checkRoute(List<Route> legs, double lat, double lon, double track, int climbFpm) {
         Route flipped = null;
+        Route guess = null;
         Route unsure = null;
         for (Route leg : legs) {
             if (leg.fromPoint == null || leg.toPoint == null) continue;
@@ -266,18 +297,34 @@ final class AirData {
             double toNm = nauticalMiles(lat, lon, leg.toPoint[0], leg.toPoint[1]);
             double length = nauticalMiles(leg.fromPoint[0], leg.fromPoint[1], leg.toPoint[0], leg.toPoint[1]);
             if (fromNm + toNm > length * ROUTE_DETOUR + ROUTE_SLACK_NM) continue;
-            if (Math.min(fromNm, toNm) < NEAR_AIRPORT_NM || turn(track, bearing(lat, lon, leg.toPoint[0], leg.toPoint[1])) <= HEADING_TOLERANCE) {
+            if (Math.min(fromNm, toNm) < NEAR_AIRPORT_NM && Math.abs(climbFpm) >= VERTICAL_FPM) {
+                // Climbing away from the nearer airport means it left there; descending means it is going there.
+                boolean nearDestination = toNm <= fromNm;
+                if (nearDestination == climbFpm < 0) return new RouteCheck(leg, ROUTE_FITS);
+                if (flipped == null) flipped = flip(leg);
+                continue;
+            }
+            if (Math.min(fromNm, toNm) < AT_AIRPORT_NM) {
+                if (guess == null) guess = leg;
+                continue;
+            }
+            if (turn(track, bearing(lat, lon, leg.toPoint[0], leg.toPoint[1])) <= HEADING_TOLERANCE) {
                 return new RouteCheck(leg, ROUTE_FITS);
             }
             if (turn(track, bearing(lat, lon, leg.fromPoint[0], leg.fromPoint[1])) <= HEADING_TOLERANCE) {
-                if (flipped == null) flipped = new Route(leg.airline, leg.to, leg.from, leg.toPoint, leg.fromPoint, leg.toIcao, leg.fromIcao);
+                if (flipped == null) flipped = flip(leg);
             } else if (unsure == null) {
                 unsure = leg;
             }
         }
         if (flipped != null) return new RouteCheck(flipped, ROUTE_FLIPPED);
+        if (guess != null) return new RouteCheck(guess, ROUTE_FITS, false);
         if (unsure != null) return new RouteCheck(unsure, ROUTE_UNSURE);
         return new RouteCheck(null, ROUTE_NO_FIT);
+    }
+
+    private static Route flip(Route leg) {
+        return new Route(leg.airline, leg.to, leg.from, leg.toPoint, leg.fromPoint, leg.toIcao, leg.fromIcao);
     }
 
     /** Initial great-circle bearing in degrees. */

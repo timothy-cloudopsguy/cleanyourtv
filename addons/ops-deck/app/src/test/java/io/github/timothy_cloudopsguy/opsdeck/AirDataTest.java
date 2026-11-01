@@ -178,10 +178,10 @@ public class AirDataTest {
     @Test
     public void aRouteThatFitsIsKeptAndOneFlownTheOtherWayIsSwapped() {
         List<AirData.Route> legs = java.util.Collections.singletonList(chicagoToDallas());
-        AirData.RouteCheck going = AirData.checkRoute(legs, 37.5, -92.5, 220);
+        AirData.RouteCheck going = AirData.checkRoute(legs, 37.5, -92.5, 220, 0);
         assertEquals(AirData.ROUTE_FITS, going.state);
         assertEquals("DFW Dallas", going.route.to);
-        AirData.RouteCheck back = AirData.checkRoute(legs, 37.5, -92.5, 40);
+        AirData.RouteCheck back = AirData.checkRoute(legs, 37.5, -92.5, 40, 0);
         assertEquals(AirData.ROUTE_FLIPPED, back.state);
         assertEquals("ORD Chicago", back.route.to);
         assertEquals(32.90, back.route.fromPoint[0], 0);
@@ -191,28 +191,28 @@ public class AirDataTest {
     @Test
     public void aRouteFarFromTheAircraftIsNotShownAndSidewaysIsNotTrusted() {
         List<AirData.Route> legs = java.util.Collections.singletonList(chicagoToDallas());
-        AirData.RouteCheck far = AirData.checkRoute(legs, 51.5, 0, 220);
+        AirData.RouteCheck far = AirData.checkRoute(legs, 51.5, 0, 220, 0);
         assertEquals(AirData.ROUTE_NO_FIT, far.state);
         assertNull(far.route);
         assertFalse(far.trusted());
-        AirData.RouteCheck sideways = AirData.checkRoute(legs, 37.5, -92.5, 130);
+        AirData.RouteCheck sideways = AirData.checkRoute(legs, 37.5, -92.5, 130, 0);
         assertEquals(AirData.ROUTE_UNSURE, sideways.state);
         assertFalse(sideways.trusted());
-        assertEquals(AirData.ROUTE_NO_FIT, AirData.checkRoute(new java.util.ArrayList<>(), 1, 1, 1).state);
+        assertEquals(AirData.ROUTE_NO_FIT, AirData.checkRoute(new java.util.ArrayList<>(), 1, 1, 1, 0).state);
     }
 
     @Test
     public void nearAnAirportTheHeadingIsNotHeldAgainstTheRoute() {
         List<AirData.Route> legs = java.util.Collections.singletonList(chicagoToDallas());
-        assertEquals(AirData.ROUTE_FITS, AirData.checkRoute(legs, 41.9, -87.8, 40).state);
+        assertEquals(AirData.ROUTE_FITS, AirData.checkRoute(legs, 41.9, -87.8, 40, 0).state);
     }
 
     @Test
     public void theLegThatFitsIsChosenAndAFittingLegBeatsAFlippedOne() {
         AirData.Route elsewhere = new AirData.Route("", "LHR", "CDG", new double[]{51.47, -0.45}, new double[]{49.0, 2.55});
-        assertEquals("DFW Dallas", AirData.checkRoute(java.util.Arrays.asList(elsewhere, chicagoToDallas()), 37.5, -92.5, 220).route.to);
+        assertEquals("DFW Dallas", AirData.checkRoute(java.util.Arrays.asList(elsewhere, chicagoToDallas()), 37.5, -92.5, 220, 0).route.to);
         AirData.Route reverse = new AirData.Route("", "DFW Dallas", "ORD Chicago", new double[]{32.90, -97.04}, new double[]{41.98, -87.90});
-        AirData.RouteCheck both = AirData.checkRoute(java.util.Arrays.asList(reverse, chicagoToDallas()), 37.5, -92.5, 220);
+        AirData.RouteCheck both = AirData.checkRoute(java.util.Arrays.asList(reverse, chicagoToDallas()), 37.5, -92.5, 220, 0);
         assertEquals(AirData.ROUTE_FITS, both.state);
         assertEquals("DFW Dallas", both.route.to);
     }
@@ -272,7 +272,7 @@ public class AirDataTest {
     @Test
     public void aSwappedRouteSwapsItsAirportCodesToo() {
         AirData.Route route = new AirData.Route("", "ORD", "DFW", new double[]{41.98, -87.90}, new double[]{32.90, -97.04}, "KORD", "KDFW");
-        assertEquals("KORD", AirData.checkRoute(java.util.Collections.singletonList(route), 37.5, -92.5, 40).route.toIcao);
+        assertEquals("KORD", AirData.checkRoute(java.util.Collections.singletonList(route), 37.5, -92.5, 40, 0).route.toIcao);
     }
 
     @Test
@@ -371,5 +371,42 @@ public class AirDataTest {
     public void oldestFirstOrdersPositionsByTime() {
         org.junit.Assert.assertArrayEquals(new int[]{1, 2, 0}, AirData.oldestFirst(new long[]{30, 10, 20}));
         assertEquals(0, AirData.oldestFirst(new long[0]).length);
+    }
+
+    private static AirData.Route atlantaToOrlando() {
+        return new AirData.Route("", "ATL Atlanta", "MCO Orlando", new double[]{33.64, -84.43}, new double[]{28.43, -81.31}, "KATL", "KMCO");
+    }
+
+    @Test
+    public void justAfterTakeoffARouteListedBackwardIsSwapped() {
+        // Climbing out of Orlando, pointing the way it left: this is the flight that showed the old check was wrong.
+        AirData.RouteCheck check = AirData.checkRoute(java.util.Collections.singletonList(atlantaToOrlando()), 28.7, -81.4, 340, 2000);
+        assertEquals(AirData.ROUTE_FLIPPED, check.state);
+        assertEquals("ATL Atlanta", check.route.to);
+        assertEquals("KATL", check.route.toIcao);
+    }
+
+    @Test
+    public void descendingNearAnAirportGoesToItAndClimbingLeavesIt() {
+        List<AirData.Route> legs = java.util.Collections.singletonList(atlantaToOrlando());
+        assertEquals(AirData.ROUTE_FITS, AirData.checkRoute(legs, 28.7, -81.4, 160, -1500).state);
+        assertEquals(AirData.ROUTE_FITS, AirData.checkRoute(legs, 33.4, -84.2, 160, 2000).state);
+        assertEquals(AirData.ROUTE_FLIPPED, AirData.checkRoute(legs, 33.4, -84.2, 340, -1500).state);
+    }
+
+    @Test
+    public void levelRightAtAnAirportIsOnlyAGuessToBeTriedAgain() {
+        AirData.RouteCheck check = AirData.checkRoute(java.util.Collections.singletonList(atlantaToOrlando()), 28.5, -81.35, 90, 0);
+        assertEquals(AirData.ROUTE_FITS, check.state);
+        assertFalse(check.sure);
+        assertTrue(AirData.checkRoute(java.util.Collections.singletonList(atlantaToOrlando()), 31, -83, 160, 0).sure);
+    }
+
+    @Test
+    public void whenBothDirectionsAreOnFileTheOneThatFitsWins() {
+        AirData.Route back = new AirData.Route("", "MCO Orlando", "ATL Atlanta", new double[]{28.43, -81.31}, new double[]{33.64, -84.43});
+        AirData.RouteCheck check = AirData.checkRoute(java.util.Arrays.asList(atlantaToOrlando(), back), 28.7, -81.4, 340, 2000);
+        assertEquals(AirData.ROUTE_FITS, check.state);
+        assertEquals("ATL Atlanta", check.route.to);
     }
 }

@@ -291,6 +291,20 @@ final class Parsers {
     }
 
     /** Mixes several sources in turn, so no one feed takes over the list. */
+    /** The first item from a source whose name starts this way: the lists mix sources, so position says nothing. */
+    static Headline firstFrom(List<Headline> items, String sourcePrefix) {
+        for (Headline h : items) if (h.source.startsWith(sourcePrefix)) return h;
+        return null;
+    }
+
+    /** Every source's latest together, newest first, so what just broke is at the top. Undated items go last, in turn. */
+    static List<Headline> newestFirst(List<List<Headline>> sources, int perSource) {
+        List<Headline> out = interleave(sources, perSource);
+        // Stable, so items at the same time stay taking turns between sources.
+        out.sort((a, b) -> Long.compare(b.time, a.time));
+        return out;
+    }
+
     static List<Headline> interleave(List<List<Headline>> sources, int perSource) {
         List<Headline> out = new ArrayList<>();
         for (int i = 0; i < perSource; i++) {

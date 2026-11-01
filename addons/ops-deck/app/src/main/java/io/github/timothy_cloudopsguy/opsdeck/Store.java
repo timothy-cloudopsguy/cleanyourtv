@@ -188,13 +188,26 @@ final class Store {
         addKev();
         addFeed(VULNS, "The Hacker News", "https://feeds.feedburner.com/TheHackersNews");
         addFeed(VULNS, "Krebs on Security", "https://krebsonsecurity.com/feed/");
-        addFeed(TECH, "Hacker News", "https://hnrss.org/frontpage?description=0");
+        addFeed(VULNS, "BleepingComputer", "https://www.bleepingcomputer.com/feed/");
+        addFeed(VULNS, "SecurityWeek", "https://www.securityweek.com/feed/");
+        addFeed(VULNS, "Help Net Security", "https://www.helpnetsecurity.com/feed/");
+        addFeed(VULNS, "SANS ISC", "https://isc.sans.edu/rssfeed_full.xml");
+        addFeed(TECH, "Hacker News", "https://news.ycombinator.com/rss");
         addFeed(TECH, "Ars Technica", "https://feeds.arstechnica.com/arstechnica/index");
+        addFeed(TECH, "Engadget", "https://www.engadget.com/rss.xml");
+        addFeed(TECH, "TechCrunch", "https://techcrunch.com/feed/");
+        addFeed(TECH, "The Verge", "https://www.theverge.com/rss/index.xml");
+        addFeed(TECH, "Lobsters", "https://lobste.rs/rss");
         addFeed(SCIENCE, "Quanta", "https://www.quantamagazine.org/feed/");
         addFeed(SCIENCE, "NASA", "https://www.nasa.gov/feed/");
         addFeed(SCIENCE, "ScienceDaily", "https://www.sciencedaily.com/rss/top/science.xml");
+        addFeed(SCIENCE, "Phys.org", "https://phys.org/rss-feed/");
+        addFeed(SCIENCE, "ScienceAlert", "https://www.sciencealert.com/feed");
         addOnThisDay();
         addFeed(HISTORY, "Smithsonian", "https://www.smithsonianmag.com/rss/history/");
+        addFeed(HISTORY, "Archaeology news", "https://phys.org/rss-feed/science-news/archaeology-fossils/");
+        addFeed(HISTORY, "The History Blog", "https://www.thehistoryblog.com/feed");
+        addFeed(HISTORY, "Archaeology", "https://www.archaeology.org/feed");
 
         jobs.add(new Job("USGS quakes", "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson",
                 5 * MINUTE, (f, ms) -> quakes = Parsers.quakes(read(f))));
@@ -305,7 +318,7 @@ final class Store {
     private void addFeed(int category, String name, String url) {
         List<Headline> slot = new ArrayList<>();
         sources[category].add(slot);
-        jobs.add(new Job(name, url, 20 * MINUTE, (f, ms) -> {
+        jobs.add(new Job(name, url, 10 * MINUTE, (f, ms) -> {
             try (InputStream in = new BufferedInputStream(new FileInputStream(f))) {
                 replace(category, slot, FeedParser.parse(in, name).items, name);
             }
@@ -336,7 +349,7 @@ final class Store {
             for (Headline h : items) {
                 slot.add(name == null ? h : new Headline(name, h.title, h.summary, h.time, h.link));
             }
-            categories[category] = Parsers.interleave(sources[category], HEADLINES_PER_SOURCE);
+            categories[category] = Parsers.newestFirst(sources[category], HEADLINES_PER_SOURCE);
         }
     }
 

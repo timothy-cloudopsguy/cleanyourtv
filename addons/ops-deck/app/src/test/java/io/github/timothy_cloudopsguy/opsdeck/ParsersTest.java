@@ -137,4 +137,25 @@ public class ParsersTest {
     private static Headline h(String title) {
         return new Headline("s", title, "", 0, "");
     }
+
+    @Test
+    public void newestFirstPutsWhatJustBrokeOnTopAndUndatedLast() {
+        Headline oldest = new Headline("A", "old", "", 100, "");
+        Headline newest = new Headline("B", "new", "", 300, "");
+        Headline middle = new Headline("A", "mid", "", 200, "");
+        Headline undated = new Headline("C", "none", "", 0, "");
+        List<Headline> out = Parsers.newestFirst(Arrays.asList(Arrays.asList(oldest, middle), Arrays.asList(newest), Arrays.asList(undated)), 2);
+        assertEquals("new", out.get(0).title);
+        assertEquals("mid", out.get(1).title);
+        assertEquals("old", out.get(2).title);
+        assertEquals("none", out.get(3).title);
+    }
+
+    @Test
+    public void bridgeTilesFindTheirOwnSourceWhereverItSorts() {
+        Headline news = new Headline("Smithsonian", "A story", "", 300, "");
+        Headline day = new Headline("On this day 1141", "An event", "", 0, "");
+        assertEquals("An event", Parsers.firstFrom(Arrays.asList(news, day), "On this day ").title);
+        assertEquals(null, Parsers.firstFrom(Arrays.asList(news), "On this day "));
+    }
 }

@@ -141,8 +141,18 @@ final class VolcanoData {
     }
 
     static Cam cam(String id) {
-        for (Cam c : CAMS) if (c.id.equals(id)) return c;
+        return cam(CAMS, id);
+    }
+
+    static Cam cam(Cam[] cams, String id) {
+        for (Cam c : cams) if (c.id.equals(id)) return c;
         return null;
+    }
+
+    /** A stream with no picture of its own: YouTube's thumbnail, which is often the channel's artwork. */
+    static Cam stream(String id, String name, String view, String source, String channel) {
+        return new Cam(id, name, view, "https://i.ytimg.com/vi/" + id + "/hqdefault_live.jpg",
+                "https://www.youtube.com/watch?v=" + id, channel, POSTER_MS, source, true);
     }
 
     /**
@@ -220,9 +230,13 @@ final class VolcanoData {
 
     /** Ids stored as a comma list: unknown ones dropped, as a stream may leave the list in an update. */
     static List<String> readWall(String stored, int max) {
+        return readWall(CAMS, stored, max);
+    }
+
+    static List<String> readWall(Cam[] cams, String stored, int max) {
         List<String> out = new ArrayList<>();
         for (String id : stored.split(",")) {
-            if (out.size() < max && cam(id) != null && !out.contains(id)) out.add(id);
+            if (out.size() < max && cam(cams, id) != null && !out.contains(id)) out.add(id);
         }
         return out;
     }
