@@ -694,6 +694,16 @@ final class AirData {
         return Math.max(worldY(MAX_LAT), Math.min(worldY(-MAX_LAT), y));
     }
 
+    /** The positions of these times, earliest first. */
+    static int[] oldestFirst(long[] times) {
+        Integer[] order = new Integer[times.length];
+        for (int i = 0; i < order.length; i++) order[i] = i;
+        java.util.Arrays.sort(order, (a, b) -> Long.compare(times[a], times[b]));
+        int[] out = new int[order.length];
+        for (int i = 0; i < out.length; i++) out[i] = order[i];
+        return out;
+    }
+
     /** Great-circle distance in nautical miles. */
     static double nauticalMiles(double lat1, double lon1, double lat2, double lon2) {
         double dLat = Math.toRadians(lat2 - lat1);

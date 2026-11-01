@@ -88,6 +88,8 @@ final class AirFeed {
     private final File tileDir;
     private final SharedPreferences prefs;
     private final ExecutorService planeThread = Executors.newSingleThreadExecutor();
+    // Over a busy city the aircraft feed is large and always due, so a card's details would wait behind it.
+    private final ExecutorService lookupThread = Executors.newSingleThreadExecutor();
     // Its own thread, so a slow photo site never holds up the aircraft.
     private final ExecutorService photoThread = Executors.newSingleThreadExecutor();
     private final Map<String, AirData.Weather> weather = Collections.synchronizedMap(new HashMap<>());
@@ -251,7 +253,7 @@ final class AirFeed {
             if (currentTrack == null) trackState = "Path limit reached";
             return currentTrack;
         }
-        planeThread.execute(() -> fetchTrack(hex));
+        lookupThread.execute(() -> fetchTrack(hex));
         return currentTrack;
     }
 
@@ -285,7 +287,7 @@ final class AirFeed {
         if (callsign.length() < 3) return null;
         AirData.RouteSet known = routes.get(callsign);
         if (known != null || !routesAsked.add(callsign)) return known;
-        planeThread.execute(() -> {
+        lookupThread.execute(() -> {
             File file = new File(dir, "air-route.feed");
             List<AirData.Route> legs = new ArrayList<>();
             String airline = "";
@@ -316,7 +318,7 @@ final class AirFeed {
         Long asked = weatherAsked.get(icao);
         if (asked == null || now - asked >= WEATHER_REFRESH_MS) {
             weatherAsked.put(icao, now);
-            planeThread.execute(() -> {
+            lookupThread.execute(() -> {
                 try {
                     File file = new File(dir, "air-weather.feed");
                     Store.download(WEATHER + icao, file);
@@ -435,7 +437,7 @@ final class AirFeed {
     AirData.AircraftInfo aircraft(String hex) {
         AirData.AircraftInfo known = aircraft.get(hex);
         if (known != null || !aircraftAsked.add(hex)) return known;
-        planeThread.execute(() -> {
+        lookupThread.execute(() -> {
             try {
                 File file = new File(dir, "air-aircraft.feed");
                 Store.download(AIRCRAFT + hex, file);
@@ -531,12 +533,15 @@ final class AirFeed {
         }
     }
 
-    private void pruneTiles() {
+    private synchronized void pruneTiles() {
         String[] names = tileDir.list();
         if (names == null || names.length <= MAX_TILES_ON_DISK) return;
         File[] files = tileDir.listFiles();
         if (files == null) return;
-        java.util.Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-        for (int i = 0; i < files.length - MAX_TILES_ON_DISK / 2; i++) files[i].delete();
+        // Read once before sorting: the other tile thread can change a file mid-sort, and a sort whose answers change throws.
+        long[] times = new long[files.length];
+        for (int i = 0; i < files.length; i++) times[i] = files[i].lastModified();
+        int[] order = AirData.oldestFirst(times);
+        for (int i = 0; i < files.length - MAX_TILES_ON_DISK / 2; i++) files[order[i]].delete();
     }
 }

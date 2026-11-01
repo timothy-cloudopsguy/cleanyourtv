@@ -366,4 +366,10 @@ public class AirDataTest {
         assertEquals("Cessna 680A", AirData.parseHexdbName("{\"Manufacturer\":\"Cessna\",\"Type\":\"Cessna 680A\"}"));
         assertEquals("", AirData.parseHexdbName("{\"status\":\"404\"}"));
     }
+
+    @Test
+    public void oldestFirstOrdersPositionsByTime() {
+        org.junit.Assert.assertArrayEquals(new int[]{1, 2, 0}, AirData.oldestFirst(new long[]{30, 10, 20}));
+        assertEquals(0, AirData.oldestFirst(new long[0]).length);
+    }
 }
