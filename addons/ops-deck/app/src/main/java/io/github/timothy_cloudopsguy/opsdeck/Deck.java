@@ -25,6 +25,8 @@ final class Deck {
         void launch(String packageName);
         /** Opens a link in the reader; says so when it cannot. */
         void openLink(String url);
+        /** Asks the owner to type something, starting from this text; the answer arrives only if they accept it. */
+        void askText(String title, String message, String start, java.util.function.Consumer<String> answer);
         /** Plays a stream in the TV's own video app. */
         void watch(String url);
         /** Plays these streams muted over the given screen rectangles {l, t, r, b}; an empty list stops them. */

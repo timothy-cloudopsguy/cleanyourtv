@@ -51,6 +51,7 @@ public final class DeckActivity extends Activity implements Deck.Actions {
         SharedPreferences prefs = getSharedPreferences("deck", Context.MODE_PRIVATE);
         store = new Store(this, getString(R.string.github_user), getString(R.string.github_watch_repo));
         sfx = new Sfx(this, prefs);
+        store.useStatusChecks(prefs);
         deck = new Deck(store, sfx, prefs, this);
         Panel[] panels = {
                 new BridgePanel(deck),
@@ -125,6 +126,22 @@ public final class DeckActivity extends Activity implements Deck.Actions {
         if (!ReaderActivity.open(this, url)) {
             Toast.makeText(this, "No page for this one: try the code with your phone", Toast.LENGTH_LONG).show();
         }
+    }
+
+    @Override
+    public void askText(String title, String message, String start, java.util.function.Consumer<String> answer) {
+        android.widget.EditText input = new android.widget.EditText(this);
+        input.setSingleLine(true);
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        input.setText(start);
+        input.setSelection(start.length());
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setView(input)
+                .setPositiveButton("Add", (d, w) -> answer.accept(input.getText().toString()))
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     @Override

@@ -53,9 +53,12 @@ final class Store {
         volatile Parsers.Summary summary;
         final int[] latency = new int[HISTORY_SIZE];
         volatile int samples;
+        final StatusData.Source source;
+        final List<Job> ownJobs = new ArrayList<>();
 
-        Service(String name) {
-            this.name = name;
+        Service(StatusData.Source source) {
+            this.source = source;
+            this.name = source.name;
         }
 
         synchronized void addLatency(int ms) {
@@ -136,8 +139,15 @@ final class Store {
         void apply(File file, int ms) throws Exception;
     }
 
-    final List<Service> services = new ArrayList<>();
-    final List<Job> jobs = new ArrayList<>();
+    // The owner can change these while the workers and the screen are using them.
+    final List<Service> services = new java.util.concurrent.CopyOnWriteArrayList<>();
+    final List<Job> jobs = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private static final String PREF_STATUS = "status_sources";
+    private android.content.SharedPreferences statusPrefs;
+    /** The latest answer to adding an address, and whether it worked; read by the status screen. */
+    volatile String addMessage = "";
+    volatile boolean addFailed;
+    volatile boolean adding;
     final String githubUser;
     final String watchRepo;
 
@@ -179,11 +189,6 @@ final class Store {
             sources[i] = new ArrayList<>();
             categories[i] = Collections.emptyList();
         }
-        addStatus("GitHub", "https://www.githubstatus.com");
-        addStatus("Cloudflare", "https://www.cloudflarestatus.com");
-        addStatus("Claude", "https://status.claude.com");
-        addStatus("OpenAI", "https://status.openai.com");
-        addStatus("Discord", "https://discordstatus.com");
 
         addKev();
         addFeed(VULNS, "The Hacker News", "https://feeds.feedburner.com/TheHackersNews");
@@ -301,18 +306,119 @@ final class Store {
         emergencies = all;
     }
 
-    private void addStatus(String name, String base) {
-        Service service = new Service(name);
+    /** The owner's list of status checks, or the starting set; call once, before start. */
+    void useStatusChecks(android.content.SharedPreferences prefs) {
+        statusPrefs = prefs;
+        for (StatusData.Source source : StatusData.load(prefs.getString(PREF_STATUS, null))) addCheck(source);
+    }
+
+    private void addCheck(StatusData.Source source) {
+        Service service = new Service(source);
+        if (source.kind.equals(StatusData.STATUSPAGE)) {
+            // The small status.json often, for the light and the latency; the full summary, up to 220 KB, less often.
+            service.ownJobs.add(new Job(source.name + " status", source.url + "/api/v2/status.json", 30_000, (f, ms) -> {
+                String[] s = Parsers.status(read(f));
+                service.indicator = s[0];
+                service.description = s[1];
+                if (ms >= 0) service.addLatency(ms);
+            }));
+            service.ownJobs.add(new Job(source.name + " summary", source.url + "/api/v2/summary.json", 5 * MINUTE,
+                    (f, ms) -> service.summary = Parsers.summary(read(f))));
+        } else {
+            // These answers can run to 250 KB, with nothing lighter to ask for, so they are checked less often.
+            boolean large = source.kind.equals(StatusData.AWS) || source.kind.equals(StatusData.GOOGLE);
+            service.ownJobs.add(new Job(source.name + " status", source.url, large ? 5 * MINUTE : 2 * MINUTE, (f, ms) -> {
+                StatusData.Reading reading = StatusData.read(source.kind, Files.readAllBytes(f.toPath()), System.currentTimeMillis());
+                service.indicator = reading.indicator;
+                service.description = reading.description;
+                service.summary = reading.summary;
+                if (ms >= 0) service.addLatency(ms);
+            }));
+        }
+        jobs.addAll(service.ownJobs);
         services.add(service);
-        // The small status.json often, for the light and the latency; the full summary, up to 220 KB, less often.
-        jobs.add(new Job(name + " status", base + "/api/v2/status.json", 30_000, (f, ms) -> {
-            String[] s = Parsers.status(read(f));
-            service.indicator = s[0];
-            service.description = s[1];
-            if (ms >= 0) service.addLatency(ms);
-        }));
-        jobs.add(new Job(name + " summary", base + "/api/v2/summary.json", 5 * MINUTE,
-                (f, ms) -> service.summary = Parsers.summary(read(f))));
+    }
+
+    boolean hasCheck(String name) {
+        for (Service s : services) if (s.name.equalsIgnoreCase(name)) return true;
+        return false;
+    }
+
+    /** False when the board is full. */
+    boolean addCheckAndSave(StatusData.Source source) {
+        if (services.size() >= StatusData.MAX_CHECKS) return false;
+        addCheck(source);
+        saveChecks();
+        return true;
+    }
+
+    void removeCheck(String name) {
+        for (Service s : services) {
+            if (s.name.equals(name)) {
+                services.remove(s);
+                jobs.removeAll(s.ownJobs);
+            }
+        }
+        saveChecks();
+    }
+
+    private void saveChecks() {
+        List<StatusData.Source> sources = new ArrayList<>();
+        for (Service s : services) sources.add(s.source);
+        statusPrefs.edit().putString(PREF_STATUS, StatusData.save(sources)).apply();
+    }
+
+    /** Tries what the owner typed, in the background: a Statuspage site first, then an RSS or Atom feed. */
+    void tryToAdd(String typed) {
+        String url = StatusData.normalise(typed);
+        if (url.isEmpty()) {
+            addFailed = true;
+            addMessage = "That is not an address. Try one like https://www.githubstatus.com";
+            return;
+        }
+        adding = true;
+        addFailed = false;
+        addMessage = "Checking " + url + "...";
+        new Thread(() -> {
+            String failed = addAddress(url);
+            addFailed = failed != null;
+            addMessage = failed != null ? failed : "Added to your board";
+            adding = false;
+        }, "status-check").start();
+    }
+
+    /** Null when it worked; otherwise what to tell the owner. */
+    private String addAddress(String url) {
+        File file = new File(cacheDir, "status-try.feed");
+        String name = "";
+        String kind = "";
+        String address = url;
+        try {
+            download(url + "/api/v2/status.json", file);
+            String json = read(file);
+            Parsers.status(json);
+            name = StatusData.pageName(json);
+            kind = StatusData.STATUSPAGE;
+        } catch (Exception notStatuspage) {
+            try {
+                download(url, file);
+                try (InputStream in = new BufferedInputStream(new FileInputStream(file))) {
+                    FeedParser.Feed feed = FeedParser.parse(in, url);
+                    // An ordinary web page can read as a feed with nothing in it.
+                    if (feed.items.isEmpty()) throw new IOException("no items");
+                    // Feed titles run on, as in "GitHub Status - Incident History".
+                    name = feed.title.split(" - ")[0].replaceAll("(?i)\\s+status$", "").trim();
+                    kind = StatusData.FEED;
+                }
+            } catch (Exception neither) {
+                return "No status feed there. Use a status page like https://www.githubstatus.com, or an RSS or Atom feed of its incidents";
+            }
+        }
+        if (name.isEmpty()) name = url.replaceFirst("https://(www\\.|status\\.)?", "");
+        if (name.length() > 24) name = name.substring(0, 24).trim();
+        name = name.replace("|", " ");
+        if (hasCheck(name)) return name + " is already on your board";
+        return addCheckAndSave(new StatusData.Source(kind, name, address)) ? null : "Your board is full: remove one first";
     }
 
     private void addFeed(int category, String name, String url) {
