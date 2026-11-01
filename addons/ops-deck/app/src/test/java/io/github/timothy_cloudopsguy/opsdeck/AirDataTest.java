@@ -170,4 +170,200 @@ public class AirDataTest {
         assertNull(AirData.parseLocation("{\"success\":false}"));
         assertFalse(AirData.parseRegional("{\"ac\":[]}", NOW).iterator().hasNext());
     }
+
+    private static AirData.Route chicagoToDallas() {
+        return new AirData.Route("", "ORD Chicago", "DFW Dallas", new double[]{41.98, -87.90}, new double[]{32.90, -97.04});
+    }
+
+    @Test
+    public void aRouteThatFitsIsKeptAndOneFlownTheOtherWayIsSwapped() {
+        List<AirData.Route> legs = java.util.Collections.singletonList(chicagoToDallas());
+        AirData.RouteCheck going = AirData.checkRoute(legs, 37.5, -92.5, 220);
+        assertEquals(AirData.ROUTE_FITS, going.state);
+        assertEquals("DFW Dallas", going.route.to);
+        AirData.RouteCheck back = AirData.checkRoute(legs, 37.5, -92.5, 40);
+        assertEquals(AirData.ROUTE_FLIPPED, back.state);
+        assertEquals("ORD Chicago", back.route.to);
+        assertEquals(32.90, back.route.fromPoint[0], 0);
+        assertTrue(back.trusted());
+    }
+
+    @Test
+    public void aRouteFarFromTheAircraftIsNotShownAndSidewaysIsNotTrusted() {
+        List<AirData.Route> legs = java.util.Collections.singletonList(chicagoToDallas());
+        AirData.RouteCheck far = AirData.checkRoute(legs, 51.5, 0, 220);
+        assertEquals(AirData.ROUTE_NO_FIT, far.state);
+        assertNull(far.route);
+        assertFalse(far.trusted());
+        AirData.RouteCheck sideways = AirData.checkRoute(legs, 37.5, -92.5, 130);
+        assertEquals(AirData.ROUTE_UNSURE, sideways.state);
+        assertFalse(sideways.trusted());
+        assertEquals(AirData.ROUTE_NO_FIT, AirData.checkRoute(new java.util.ArrayList<>(), 1, 1, 1).state);
+    }
+
+    @Test
+    public void nearAnAirportTheHeadingIsNotHeldAgainstTheRoute() {
+        List<AirData.Route> legs = java.util.Collections.singletonList(chicagoToDallas());
+        assertEquals(AirData.ROUTE_FITS, AirData.checkRoute(legs, 41.9, -87.8, 40).state);
+    }
+
+    @Test
+    public void theLegThatFitsIsChosenAndAFittingLegBeatsAFlippedOne() {
+        AirData.Route elsewhere = new AirData.Route("", "LHR", "CDG", new double[]{51.47, -0.45}, new double[]{49.0, 2.55});
+        assertEquals("DFW Dallas", AirData.checkRoute(java.util.Arrays.asList(elsewhere, chicagoToDallas()), 37.5, -92.5, 220).route.to);
+        AirData.Route reverse = new AirData.Route("", "DFW Dallas", "ORD Chicago", new double[]{32.90, -97.04}, new double[]{41.98, -87.90});
+        AirData.RouteCheck both = AirData.checkRoute(java.util.Arrays.asList(reverse, chicagoToDallas()), 37.5, -92.5, 220);
+        assertEquals(AirData.ROUTE_FITS, both.state);
+        assertEquals("DFW Dallas", both.route.to);
+    }
+
+    @Test
+    public void vrsRoutesBecomeOneRoutePerLeg() throws Exception {
+        List<AirData.Route> legs = AirData.parseVrsRoute("{\"_airports\":[{\"iata\":\"STL\",\"location\":\"St Louis\",\"lat\":38.7,\"lon\":-90.3},"
+                + "{\"iata\":\"DAL\",\"location\":\"Dallas\",\"lat\":32.8,\"lon\":-96.8},{\"iata\":\"HOU\",\"lat\":29.6,\"lon\":-95.2}]}");
+        assertEquals(2, legs.size());
+        assertEquals("STL St Louis", legs.get(0).from);
+        assertEquals("HOU", legs.get(1).to);
+        assertEquals(-95.2, legs.get(1).toPoint[1], 0);
+        assertTrue(AirData.parseVrsRoute("{}").isEmpty());
+    }
+
+    @Test
+    public void landingTimeRoundsUpAndNeedsRealSpeed() {
+        assertEquals("near landing, its speed now", 15, AirData.minutesToLand(60, 250, 430));
+        assertEquals("far out, the approach is added", 70, AirData.minutesToLand(450, 450, 0));
+        assertEquals("still climbing counts as cruising", 125, AirData.minutesToLand(814, 287, 430));
+        assertEquals("a tailwind counts", 100, AirData.minutesToLand(814, 560, 430));
+        assertEquals(-1, AirData.minutesToLand(100, 50, 430));
+        assertEquals("45M", AirData.duration(45));
+        assertEquals("2H 05M", AirData.duration(125));
+    }
+
+    @Test
+    public void aTrackKnowsWhetherItSawTheTakeoff() throws Exception {
+        long t = NOW / 1000;
+        AirData.Track low = AirData.parseTrack("{\"path\":[[" + (t - 600) + ",40.0,-74.0,300.0,90,false],[" + (t - 400) + ",40.0,-73.0,9000,90,false]]}", NOW);
+        assertTrue(low.sawTakeoff());
+        assertEquals(NOW - 600_000, low.startMs);
+        AirData.Track high = AirData.parseTrack("{\"path\":[[" + (t - 600) + ",40.0,-74.0,9000,90,false],[" + (t - 400) + ",40.0,-73.0,9000,90,false]]}", NOW);
+        assertFalse(high.sawTakeoff());
+    }
+
+    @Test
+    public void optionalFieldsAreReadAndTheAutopilotValueIsRounded() throws Exception {
+        AirData.Plane p = AirData.parseRegional("{\"ac\":[{\"hex\":\"a\",\"lat\":1,\"lon\":1,\"nav_altitude_mcp\":20992,\"wd\":307,\"ws\":50,\"mach\":0.748}]}", NOW).get(0);
+        assertEquals(21000, p.targetFeet);
+        assertEquals(307, p.windFrom);
+        assertEquals(50, p.windKnots);
+        assertEquals(0.748, p.mach, 0);
+        AirData.Plane bare = AirData.parseRegional("{\"ac\":[{\"hex\":\"b\",\"lat\":1,\"lon\":1}]}", NOW).get(0);
+        assertEquals(0, bare.targetFeet);
+        assertEquals(-1, bare.windKnots);
+    }
+
+    @Test
+    public void airframeDetailsJoinMakerAndType() throws Exception {
+        AirData.AircraftInfo info = AirData.parseAircraft("{\"response\":{\"aircraft\":{\"type\":\"A320 251NSL\",\"manufacturer\":\"Airbus\",\"registered_owner\":\"easyJet Airline\"}}}");
+        assertEquals("Airbus A320 251NSL", info.name);
+        assertEquals("easyJet Airline", info.owner);
+        assertNull(AirData.parseAircraft("{\"response\":\"unknown aircraft\"}"));
+    }
+
+    @Test
+    public void aSwappedRouteSwapsItsAirportCodesToo() {
+        AirData.Route route = new AirData.Route("", "ORD", "DFW", new double[]{41.98, -87.90}, new double[]{32.90, -97.04}, "KORD", "KDFW");
+        assertEquals("KORD", AirData.checkRoute(java.util.Collections.singletonList(route), 37.5, -92.5, 40).route.toIcao);
+    }
+
+    @Test
+    public void weatherBecomesOneLineAndAnEmptyAnswerIsNone() throws Exception {
+        AirData.Weather weather = AirData.parseWeather("[{\"temp\":12.8,\"wspd\":3,\"wgst\":18,\"wxString\":\"-RA\",\"cover\":\"BKN\",\"fltCat\":\"MVFR\"}]");
+        assertEquals("55F, -RA, wind 3G18 kt, BKN", weather.line);
+        assertEquals("MVFR", weather.category);
+        assertEquals("wind 4 kt", AirData.parseWeather("[{\"temp\":null,\"wspd\":4}]").line);
+        assertNull(AirData.parseWeather("[]"));
+    }
+
+    @Test
+    public void aPhotoGivesItsFullSizeAddressAndItsPhotographer() throws Exception {
+        AirData.Photo photo = AirData.parsePhoto("{\"status\":200,\"count\":1,\"data\":[{\"image\":\"https://airport-data.com/images/aircraft/thumbnails/001/912/001912792.jpg\","
+                + "\"link\":\"https://airport-data.com/aircraft/photo/001912792\",\"photographer\":\"Shunn311\"}]}");
+        assertEquals("https://image.airport-data.com/aircraft/001912792.jpg", photo.full);
+        assertEquals("Shunn311", photo.photographer);
+        assertNull(AirData.parsePhoto("{\"status\":404,\"error\":\"Aircraft thumbnail not found.\"}"));
+        assertEquals("", AirData.parsePhoto("{\"data\":[{\"image\":\"https://x/1.jpg\",\"link\":\"nonsense\"}]}").full);
+    }
+
+    @Test
+    public void aProfileShowsAltitudeAndSpeedOverTimeAndIgnoresNoise() throws Exception {
+        long t = NOW / 1000;
+        // 0.5 degrees of latitude is 30 nm: in 240 s that is 450 kt. The third point jumps too far to be real.
+        AirData.Track track = AirData.parseTrack("{\"path\":[[" + (t - 960) + ",40.0,-74.0,0,0,false],[" + (t - 720) + ",40.5,-74.0,3000,0,false],"
+                + "[" + (t - 480) + ",50.0,-74.0,6000,0,false],[" + (t - 240) + ",50.5,-74.0,9000,0,false]]}", NOW);
+        AirData.Profile profile = AirData.profile(track, 4);
+        assertEquals(4, profile.feet.length);
+        assertEquals(29527, profile.maxFeet);
+        assertEquals(450, profile.maxKnots, 3);
+        assertEquals("a slice with no good speed holds the last", profile.knots[1], profile.knots[2]);
+        assertEquals(0, profile.feet[0]);
+    }
+
+    @Test
+    public void planespottersGivesTheLargerPictureAndItsPhotographer() throws Exception {
+        AirData.Photo photo = AirData.parsePlanespotters("{\"photos\":[{\"thumbnail\":{\"src\":\"https://t.x/t.jpg\"},\"thumbnail_large\":{\"src\":\"https://t.x/280.jpg\"},\"photographer\":\"Wolfgang Kaiser\"}]}");
+        assertEquals("https://t.x/280.jpg", photo.full);
+        assertEquals("Wolfgang Kaiser", photo.photographer);
+        assertFalse(photo.similarOnly());
+        assertNull(AirData.parsePlanespotters("{\"photos\":[]}"));
+    }
+
+    @Test
+    public void photoSearchesNarrowDownButNeverToJustTheMaker() {
+        assertEquals(java.util.Arrays.asList("Boeing 737NG 7H4/W", "Boeing 737NG"), AirData.photoSearches("Boeing 737NG 7H4/W"));
+        assertEquals(java.util.Collections.singletonList("Cessna 680A"), AirData.photoSearches("Cessna 680A"));
+        assertTrue(AirData.photoSearches("").isEmpty());
+    }
+
+    private static String commonsPage(int index, String title, int width, int height, String licence) {
+        return "\"" + index + "\":{\"index\":" + index + ",\"title\":\"File:" + title + "\",\"imageinfo\":[{\"width\":" + width + ",\"height\":" + height
+                + ",\"thumburl\":\"https://thumb/" + index + ".jpg\",\"extmetadata\":{\"Artist\":{\"value\":\"<a href='x'>Matti</a>\"},\"LicenseShortName\":{\"value\":\"" + licence + "\"}}}]}";
+    }
+
+    @Test
+    public void aCommonsSearchTakesTheBestWideWholeAircraftAndNeedsALicence() throws Exception {
+        AirData.Photo photo = AirData.parseCommons("{\"query\":{\"pages\":{" + commonsPage(1, "Cessna cockpit.jpg", 800, 600, "CC0") + ","
+                + commonsPage(2, "Tall.jpg", 600, 800, "CC0") + "," + commonsPage(4, "Later.jpg", 800, 600, "CC0") + ","
+                + commonsPage(3, "N596QS.jpg", 800, 600, "CC BY 4.0") + "}}}");
+        assertEquals("https://thumb/3.jpg", photo.thumbnail);
+        assertEquals("Matti", photo.photographer);
+        assertEquals("CC BY 4.0", photo.licence);
+        assertTrue(photo.similarOnly());
+        assertNull(AirData.parseCommons("{\"query\":{\"pages\":{" + commonsPage(1, "A.jpg", 800, 600, "") + "}}}"));
+        assertNull(AirData.parseCommons("{\"batchcomplete\":\"\"}"));
+    }
+
+    @Test
+    public void historyKeepsSpacedSamplesOfFlyingAircraftAndForgetsOldOnes() throws Exception {
+        AirData.History history = new AirData.History();
+        String json = "{\"ac\":[{\"hex\":\"a\",\"lat\":1,\"lon\":1,\"alt_baro\":9000},{\"hex\":\"g\",\"lat\":1,\"lon\":1,\"alt_baro\":\"ground\"}]}";
+        List<AirData.Plane> planes = AirData.parseRegional(json, NOW);
+        history.add(planes, NOW);
+        history.add(planes, NOW + 5_000);
+        assertNull("too close to count as a second sample", history.track("a"));
+        history.add(planes, NOW + 31_000);
+        AirData.Track track = history.track("a");
+        assertEquals(2, track.times.length);
+        assertEquals(9000, track.feet[1]);
+        assertNull(history.track("g"));
+        history.add(new java.util.ArrayList<>(), NOW + 20 * 60_000);
+        assertNull(history.track("a"));
+    }
+
+    @Test
+    public void planespottersKeepsItsPhotoPageAndHexdbNamesAType() throws Exception {
+        assertEquals("https://p/1?utm_source=api", AirData.parsePlanespotters("{\"photos\":[{\"thumbnail\":{\"src\":\"https://t.x/t.jpg\"},\"link\":\"https://p/1?utm_source=api\"}]}").link);
+        assertEquals("Cessna 680A", AirData.parseHexdbName("{\"Manufacturer\":\"Cessna\",\"Type\":\"680A\"}"));
+        assertEquals("Cessna 680A", AirData.parseHexdbName("{\"Manufacturer\":\"Cessna\",\"Type\":\"Cessna 680A\"}"));
+        assertEquals("", AirData.parseHexdbName("{\"status\":\"404\"}"));
+    }
 }

@@ -9,6 +9,7 @@ import android.util.LruCache;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -48,7 +49,20 @@ final class AirFeed {
     private static final String WORLD = "https://opensky-network.org/api/states/all";
     private static final String TRACK = "https://opensky-network.org/api/tracks/all?time=0&icao24=";
     private static final long TRACK_REFRESH_MS = 5 * 60_000;
+    /** OpenSky's path allowance is separate from its traffic one, and takes hours to come back. */
+    private static final long TRACK_LIMITED_MS = 30 * 60_000;
     private static final String ROUTE = "https://api.adsbdb.com/v0/callsign/";
+    private static final String ROUTE_VRS = "https://vrs-standing-data.adsb.lol/routes/%s/%s.json";
+    private static final String AIRCRAFT = "https://api.adsbdb.com/v0/aircraft/";
+    private static final String PHOTO = "https://airport-data.com/api/ac_thumb.json?n=1&m=";
+    private static final String HEXDB = "https://hexdb.io/api/v1/aircraft/";
+    private static final String PLANESPOTTERS_HEX = "https://api.planespotters.net/pub/photos/hex/";
+    private static final String PLANESPOTTERS_REG = "https://api.planespotters.net/pub/photos/reg/";
+    private static final String COMMONS_START = "https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search&gsrnamespace=6&gsrlimit=12&gsrsearch=";
+    private static final String COMMONS_END = "&prop=imageinfo&iiprop=url|size|extmetadata&iiurlwidth=440&iiextmetadatafilter=LicenseShortName|Artist";
+    private static final int PHOTO_WIDTH = 440;
+    private static final String WEATHER = "https://aviationweather.gov/api/data/metar?format=json&ids=";
+    private static final long WEATHER_REFRESH_MS = 15 * 60_000;
     private static final String LOCATE = "https://ipwho.is/";
     private static final String TILE = "https://tile.openstreetmap.org/%d/%d/%d.png";
 
@@ -64,6 +78,7 @@ final class AirFeed {
     volatile String trackState = "";
     private volatile String trackHex = "";
     private long trackAsked;
+    private volatile long trackLimitedUntil;
 
     private final AirData.Estimates estimates;
     private volatile List<AirData.Plane> military = Collections.emptyList();
@@ -73,8 +88,21 @@ final class AirFeed {
     private final File tileDir;
     private final SharedPreferences prefs;
     private final ExecutorService planeThread = Executors.newSingleThreadExecutor();
+    // Its own thread, so a slow photo site never holds up the aircraft.
+    private final ExecutorService photoThread = Executors.newSingleThreadExecutor();
+    private final Map<String, AirData.Weather> weather = Collections.synchronizedMap(new HashMap<>());
+    private final Map<String, Long> weatherAsked = Collections.synchronizedMap(new HashMap<>());
+    private volatile String photoHex = "";
+    /** The picture of the aircraft in photoHex; null while loading or when there is none. Only one is ever kept. */
+    volatile Bitmap photo;
+    /** Who to credit for photo. */
+    volatile AirData.Photo photoDetails;
+    private final Map<String, AirData.Photo> similarPhotos = Collections.synchronizedMap(new HashMap<>());
+    final AirData.History history = new AirData.History();
     private final ExecutorService tileThreads = Executors.newFixedThreadPool(2);
-    private final Map<String, AirData.Route> routes = Collections.synchronizedMap(new HashMap<>());
+    private final Map<String, AirData.RouteSet> routes = Collections.synchronizedMap(new HashMap<>());
+    private final Map<String, AirData.AircraftInfo> aircraft = Collections.synchronizedMap(new HashMap<>());
+    private final Set<String> aircraftAsked = Collections.synchronizedSet(new HashSet<>());
     private final Set<String> routesAsked = Collections.synchronizedSet(new HashSet<>());
     private final LruCache<String, Bitmap> tiles = new LruCache<>(MAX_TILES_IN_MEMORY);
     private final Map<String, Long> tileFailed = Collections.synchronizedMap(new HashMap<>());
@@ -172,6 +200,7 @@ final class AirFeed {
                 Store.download(String.format(Locale.US, REGIONAL_FI, lat, lon, RADIUS_NM), file);
             }
             List<AirData.Plane> parsed = AirData.parseRegional(Store.read(file), System.currentTimeMillis());
+            history.add(parsed, System.currentTimeMillis());
             if (wantRegional) publish(parsed, name);
         } catch (Exception e) {
             if (wantRegional) problem = "Live traffic is not answering";
@@ -218,6 +247,10 @@ final class AirFeed {
             currentTrack = null;
             trackState = "Finding flight path...";
         }
+        if (now < trackLimitedUntil) {
+            if (currentTrack == null) trackState = "Path limit reached";
+            return currentTrack;
+        }
         planeThread.execute(() -> fetchTrack(hex));
         return currentTrack;
     }
@@ -229,32 +262,187 @@ final class AirFeed {
             File file = new File(dir, "air-track.feed");
             Store.download(TRACK + hex.toLowerCase(Locale.ROOT), file);
             found = AirData.parseTrack(Store.read(file), System.currentTimeMillis());
-            state = found == null ? "No flight path on record" : "";
+            state = found == null ? "No path on record" : "";
         } catch (IOException e) {
             String message = String.valueOf(e.getMessage());
-            state = message.contains("429") ? "Path limit reached for today"
-                    : message.contains("404") ? "No flight path on record" : "Flight path not answering";
+            if (message.contains("429")) trackLimitedUntil = System.currentTimeMillis() + TRACK_LIMITED_MS;
+            // These share a card row about twenty characters wide.
+            state = message.contains("429") ? "Path limit reached"
+                    : message.contains("404") ? "No path on record" : "Path not answering";
         } catch (Exception e) {
-            state = "No flight path on record";
+            state = "No path on record";
         }
         if (!hex.equals(trackHex)) return;
         if (found != null || currentTrack == null) currentTrack = found;
         trackState = found != null || currentTrack == null ? state : "";
     }
 
-    /** The route for a callsign, if known yet; the first ask starts the lookup. */
-    AirData.Route route(String callsign) {
-        if (callsign.isEmpty()) return null;
-        AirData.Route known = routes.get(callsign);
+    /**
+     * The routes on file for a callsign, if known yet; the first ask starts the lookup. VRS was right more often when
+     * tried against live traffic, so it comes first, but adsbdb fills gaps and is the one with the airline's name.
+     */
+    AirData.RouteSet routes(String callsign) {
+        if (callsign.length() < 3) return null;
+        AirData.RouteSet known = routes.get(callsign);
         if (known != null || !routesAsked.add(callsign)) return known;
         planeThread.execute(() -> {
+            File file = new File(dir, "air-route.feed");
+            List<AirData.Route> legs = new ArrayList<>();
+            String airline = "";
             try {
-                File file = new File(dir, "air-route.feed");
+                Store.download(String.format(Locale.US, ROUTE_VRS, callsign.substring(0, 2), callsign), file);
+                legs.addAll(AirData.parseVrsRoute(Store.read(file)));
+            } catch (Exception e) {
+                // A flight VRS does not list answers 404.
+            }
+            try {
                 Store.download(ROUTE + callsign, file);
                 AirData.Route route = AirData.parseRoute(Store.read(file));
-                if (route != null) routes.put(callsign, route);
+                if (route != null) {
+                    legs.add(route);
+                    airline = route.airline;
+                }
             } catch (Exception e) {
-                // adsbdb answers 404 for a flight it does not know: the card just shows no route.
+                // adsbdb answers 404 for a flight it does not know.
+            }
+            routes.put(callsign, new AirData.RouteSet(airline, legs));
+        });
+        return null;
+    }
+
+    /** The latest weather at an airport, if known yet, asked for now and then while it is wanted. */
+    AirData.Weather weather(String icao, long now) {
+        if (icao.isEmpty()) return null;
+        Long asked = weatherAsked.get(icao);
+        if (asked == null || now - asked >= WEATHER_REFRESH_MS) {
+            weatherAsked.put(icao, now);
+            planeThread.execute(() -> {
+                try {
+                    File file = new File(dir, "air-weather.feed");
+                    Store.download(WEATHER + icao, file);
+                    AirData.Weather found = AirData.parseWeather(Store.read(file));
+                    if (found != null) weather.put(icao, found);
+                } catch (Exception e) {
+                    // The card just leaves the line out.
+                }
+            });
+        }
+        return weather.get(icao);
+    }
+
+    /** Asks for a picture of this aircraft, once each time it changes. If none can be found, photo stays null. */
+    void wantPhoto(String hex, String registration, String description) {
+        if (hex.equals(photoHex)) return;
+        photoHex = hex;
+        photo = null;
+        photoDetails = null;
+        photoThread.execute(() -> {
+            if (!hex.equals(photoHex)) return;
+            // Pictures of this very aircraft first; a picture of one like it only if there is none.
+            AirData.Photo[] found = new AirData.Photo[1];
+            Bitmap bitmap = firstPhoto(found, hex, registration, description);
+            if (bitmap != null && hex.equals(photoHex)) {
+                photoDetails = found[0];
+                photo = bitmap;
+            }
+        });
+    }
+
+    private Bitmap firstPhoto(AirData.Photo[] found, String hex, String registration, String description) {
+        File file = new File(dir, "air-photo.feed");
+        String upper = hex.toUpperCase(Locale.ROOT);
+        try {
+            Store.download(PHOTO + upper, file);
+            found[0] = AirData.parsePhoto(Store.read(file));
+            Bitmap bitmap = load(found[0]);
+            if (bitmap != null) return bitmap;
+        } catch (Exception e) {
+            // On to the next source: a site not knowing an aircraft answers 404.
+        }
+        for (String url : new String[]{PLANESPOTTERS_HEX + upper, registration.isEmpty() ? "" : PLANESPOTTERS_REG + registration}) {
+            if (url.isEmpty()) continue;
+            try {
+                Store.download(url, file);
+                found[0] = AirData.parsePlanespotters(Store.read(file));
+                Bitmap bitmap = load(found[0]);
+                if (bitmap != null) return bitmap;
+            } catch (Exception e) {
+                // On to the next source.
+            }
+        }
+        String name = description;
+        try {
+            Store.download(AIRCRAFT + hex, file);
+            AirData.AircraftInfo info = AirData.parseAircraft(Store.read(file));
+            if (info != null && !info.name.isEmpty()) name = info.name;
+        } catch (Exception e) {
+            // Keep the description the live feed gave, if any.
+        }
+        if (name.isEmpty()) {
+            try {
+                Store.download(HEXDB + hex, file);
+                name = AirData.parseHexdbName(Store.read(file));
+            } catch (Exception e) {
+                // Nobody knows the type, so there is nothing to search for.
+            }
+        }
+        for (String search : AirData.photoSearches(name)) {
+            try {
+                AirData.Photo known = similarPhotos.get(search);
+                if (known == null) {
+                    Store.download(COMMONS_START + java.net.URLEncoder.encode("\"" + search + "\" filetype:bitmap", "UTF-8") + COMMONS_END, file);
+                    known = AirData.parseCommons(Store.read(file));
+                }
+                if (known != null) {
+                    similarPhotos.put(search, known);
+                    found[0] = known;
+                    Bitmap bitmap = load(known);
+                    if (bitmap != null) return bitmap;
+                }
+            } catch (Exception e) {
+                // Try a broader search.
+            }
+        }
+        return null;
+    }
+
+    /** The larger copy, or the small one if that fails: blurry at this size, but better than none. */
+    private Bitmap load(AirData.Photo found) {
+        if (found == null) return null;
+        Bitmap bitmap = found.full.isEmpty() ? null : loadPhoto(found.full);
+        return bitmap != null || found.thumbnail.isEmpty() ? bitmap : loadPhoto(found.thumbnail);
+    }
+
+    private Bitmap loadPhoto(String url) {
+        try {
+            File file = new File(dir, "air-photo.jpg");
+            Store.download(url, file);
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(file.getPath(), options);
+            int sample = 1;
+            while (options.outWidth / (sample * 2) >= PHOTO_WIDTH) sample *= 2;
+            options.inJustDecodeBounds = false;
+            options.inSampleSize = sample;
+            options.inPreferredConfig = Bitmap.Config.RGB_565;
+            return BitmapFactory.decodeFile(file.getPath(), options);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** Details of one airframe, if known yet; the first ask starts the lookup. */
+    AirData.AircraftInfo aircraft(String hex) {
+        AirData.AircraftInfo known = aircraft.get(hex);
+        if (known != null || !aircraftAsked.add(hex)) return known;
+        planeThread.execute(() -> {
+            try {
+                File file = new File(dir, "air-aircraft.feed");
+                Store.download(AIRCRAFT + hex, file);
+                AirData.AircraftInfo info = AirData.parseAircraft(Store.read(file));
+                if (info != null) aircraft.put(hex, info);
+            } catch (Exception e) {
+                // Not every airframe is known: the card just shows its type code.
             }
         });
         return null;

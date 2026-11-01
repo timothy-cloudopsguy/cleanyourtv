@@ -31,6 +31,7 @@ final class AirData {
     private static final double STALE_SECONDS = 60;
     private static final long TRACK_MAX_AGE_MS = 30 * 60_000;
     private static final int MAX_TRACK_POINTS = 500;
+    private static final int TAKEOFF_MAX_FEET = 5_000;
 
     private AirData() {}
 
@@ -56,6 +57,15 @@ final class AirData {
         final int kind;
         /** No receiver has heard it since timeMs: this is where it should be, not where it was reported. */
         final boolean estimated;
+        // Only some aircraft broadcast these, and the world snapshot has none of them.
+        /** The altitude set on the autopilot; 0 when not reported. */
+        int targetFeet;
+        /** The live feed's description of the type, where it gives one, as in "BOMBARDIER Regional Jet CRJ-700". */
+        String description = "";
+        /** Direction the wind blows from; -1 when not reported. */
+        int windFrom = -1;
+        int windKnots = -1;
+        double mach;
 
         Plane(String hex, String callsign, String type, String registration, boolean ground, int altitudeFeet,
                 int speedKnots, float track, int climbFpm, String squawk, boolean military,
@@ -132,8 +142,17 @@ final class AirData {
         /** {lat, lon}, or null when adsbdb does not give them. */
         final double[] fromPoint;
         final double[] toPoint;
+        /** The airports' ICAO codes, for their weather; empty when not given. */
+        final String fromIcao;
+        final String toIcao;
 
         Route(String airline, String from, String to, double[] fromPoint, double[] toPoint) {
+            this(airline, from, to, fromPoint, toPoint, "", "");
+        }
+
+        Route(String airline, String from, String to, double[] fromPoint, double[] toPoint, String fromIcao, String toIcao) {
+            this.fromIcao = fromIcao;
+            this.toIcao = toIcao;
             this.airline = airline;
             this.from = from;
             this.to = to;
@@ -195,18 +214,451 @@ final class AirData {
         return out;
     }
 
+    /** Every route on file for a callsign, best source first, and the airline's name when known. */
+    static final class RouteSet {
+        final String airline;
+        final List<Route> legs;
+
+        RouteSet(String airline, List<Route> legs) {
+            this.airline = airline;
+            this.legs = legs;
+        }
+    }
+
+    /** A route that fits where the aircraft is and where it is heading. */
+    static final int ROUTE_FITS = 0;
+    /** The route on file, but this aircraft is flying it the other way, so the ends have been swapped. */
+    static final int ROUTE_FLIPPED = 1;
+    /** Along the route but heading neither way, as when vectored or holding: shown, but not counted on. */
+    static final int ROUTE_UNSURE = 2;
+    /** Nothing on file is anywhere near this flight. Flight numbers get reused, so this is common. */
+    static final int ROUTE_NO_FIT = 3;
+
+    static final class RouteCheck {
+        /** Null when nothing fits. */
+        final Route route;
+        final int state;
+
+        RouteCheck(Route route, int state) {
+            this.route = route;
+            this.state = state;
+        }
+
+        /** Good enough to work out a distance and landing time from. */
+        boolean trusted() {
+            return state == ROUTE_FITS || state == ROUTE_FLIPPED;
+        }
+    }
+
+    private static final double ROUTE_DETOUR = 1.25;
+    private static final double ROUTE_SLACK_NM = 60;
+    /** Near an airport an aircraft can be pointing any way, so its heading says nothing. */
+    private static final double NEAR_AIRPORT_NM = 60;
+    private static final double HEADING_TOLERANCE = 70;
+
+    /** Looked-up routes go by flight number alone, and are often wrong or backward: this tests each against the aircraft. */
+    static RouteCheck checkRoute(List<Route> legs, double lat, double lon, double track) {
+        Route flipped = null;
+        Route unsure = null;
+        for (Route leg : legs) {
+            if (leg.fromPoint == null || leg.toPoint == null) continue;
+            double fromNm = nauticalMiles(lat, lon, leg.fromPoint[0], leg.fromPoint[1]);
+            double toNm = nauticalMiles(lat, lon, leg.toPoint[0], leg.toPoint[1]);
+            double length = nauticalMiles(leg.fromPoint[0], leg.fromPoint[1], leg.toPoint[0], leg.toPoint[1]);
+            if (fromNm + toNm > length * ROUTE_DETOUR + ROUTE_SLACK_NM) continue;
+            if (Math.min(fromNm, toNm) < NEAR_AIRPORT_NM || turn(track, bearing(lat, lon, leg.toPoint[0], leg.toPoint[1])) <= HEADING_TOLERANCE) {
+                return new RouteCheck(leg, ROUTE_FITS);
+            }
+            if (turn(track, bearing(lat, lon, leg.fromPoint[0], leg.fromPoint[1])) <= HEADING_TOLERANCE) {
+                if (flipped == null) flipped = new Route(leg.airline, leg.to, leg.from, leg.toPoint, leg.fromPoint, leg.toIcao, leg.fromIcao);
+            } else if (unsure == null) {
+                unsure = leg;
+            }
+        }
+        if (flipped != null) return new RouteCheck(flipped, ROUTE_FLIPPED);
+        if (unsure != null) return new RouteCheck(unsure, ROUTE_UNSURE);
+        return new RouteCheck(null, ROUTE_NO_FIT);
+    }
+
+    /** Initial great-circle bearing in degrees. */
+    static double bearing(double lat1, double lon1, double lat2, double lon2) {
+        double p1 = Math.toRadians(lat1);
+        double p2 = Math.toRadians(lat2);
+        double d = Math.toRadians(lon2 - lon1);
+        double degrees = Math.toDegrees(Math.atan2(Math.sin(d) * Math.cos(p2),
+                Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(d)));
+        return (degrees + 360) % 360;
+    }
+
+    private static double turn(double a, double b) {
+        double d = Math.abs(a - b) % 360;
+        return d > 180 ? 360 - d : d;
+    }
+
+    private static final double FAR_FROM_LANDING_NM = 100;
+    private static final int APPROACH_MINUTES = 10;
+
+    /** Roughly how fast this class cruises; 0 when it varies too much to assume. */
+    static int cruiseKnots(int kind) {
+        switch (kind) {
+            case Aircraft.NARROW: case Aircraft.WIDE: case Aircraft.FOUR_JET: case Aircraft.REGIONAL: case Aircraft.BIZJET:
+                return 430;
+            case Aircraft.TURBOPROP:
+                return 280;
+            default:
+                return 0;
+        }
+    }
+
+    /**
+     * Minutes to landing, up to the next five as it is only a rough guess; -1 if too slow to say. Far out, an aircraft
+     * still climbing has not reached its cruising speed, and it will not fly straight in at the end either.
+     */
+    static int minutesToLand(double nm, int knots, int cruiseKnots) {
+        if (knots < 100) return -1;
+        boolean far = nm > FAR_FROM_LANDING_NM;
+        double minutes = nm / (far ? Math.max(knots, cruiseKnots) : knots) * 60 + (far ? APPROACH_MINUTES : 0);
+        return (int) (Math.ceil(minutes / 5) * 5);
+    }
+
+    /** "45M" or "2H 05M". */
+    static String duration(long minutes) {
+        return minutes < 60 ? minutes + "M" : String.format(java.util.Locale.US, "%dH %02dM", minutes / 60, minutes % 60);
+    }
+
+    /** Airline-sized aircraft have the cabin rule about laptops below 10,000 feet; a light aircraft does not. */
+    static boolean airliner(Plane p) {
+        return p.kind == Aircraft.NARROW || p.kind == Aircraft.WIDE || p.kind == Aircraft.FOUR_JET || p.kind == Aircraft.REGIONAL;
+    }
+
+    /** The latest observation at an airport, in a line for the card. */
+    static final class Weather {
+        final String line;
+        /** VFR, MVFR, IFR or LIFR, the standard flying conditions; empty when not reported. */
+        final String category;
+
+        Weather(String line, String category) {
+            this.line = line;
+            this.category = category;
+        }
+    }
+
+    /** aviationweather.gov's METAR answer for one airport; null when it has no report. */
+    static Weather parseWeather(String json) throws JSONException {
+        JSONArray reports = new JSONArray(json);
+        if (reports.length() == 0) return null;
+        JSONObject o = reports.getJSONObject(0);
+        StringBuilder line = new StringBuilder();
+        String category = o.optString("fltCat", "");
+        if (o.has("temp") && !o.isNull("temp")) {
+            line.append(Math.round(o.getDouble("temp") * 9 / 5 + 32)).append("F");
+        }
+        String wx = o.optString("wxString", "");
+        if (!wx.isEmpty()) append(line, wx);
+        if (o.has("wspd") && !o.isNull("wspd")) {
+            append(line, "wind " + o.optInt("wspd") + (o.has("wgst") && !o.isNull("wgst") ? "G" + o.optInt("wgst") : "") + " kt");
+        }
+        String cover = o.optString("cover", "");
+        if (!cover.isEmpty()) append(line, cover);
+        return new Weather(line.toString(), category);
+    }
+
+    private static void append(StringBuilder line, String part) {
+        if (line.length() > 0) line.append(", ");
+        line.append(part);
+    }
+
+    /** A picture of an aircraft, with who took it and where it came from. */
+    static final class Photo {
+        final String thumbnail;
+        /** A larger copy of the same picture; empty when there is none. */
+        final String full;
+        final String photographer;
+        final String source;
+        /** Of another aircraft of about the same type, found by searching; empty for a picture of this very aircraft. */
+        final String licence;
+        /** The picture's own page, when its source asks to be linked to; empty otherwise. */
+        final String link;
+
+        Photo(String thumbnail, String full, String photographer, String source, String licence) {
+            this(thumbnail, full, photographer, source, licence, "");
+        }
+
+        Photo(String thumbnail, String full, String photographer, String source, String licence, String link) {
+            this.link = link;
+            this.thumbnail = thumbnail;
+            this.full = full;
+            this.photographer = photographer;
+            this.source = source;
+            this.licence = licence;
+        }
+
+        boolean similarOnly() {
+            return !licence.isEmpty();
+        }
+    }
+
+    /** airport-data.com, by transponder code; null when there is no picture. Pages and full-size files share a number, as in .../aircraft/photo/001912792. */
+    static Photo parsePhoto(String json) throws JSONException {
+        JSONArray data = new JSONObject(json).optJSONArray("data");
+        if (data == null || data.length() == 0) return null;
+        JSONObject o = data.getJSONObject(0);
+        String image = o.optString("image", "");
+        if (!image.startsWith("https://")) return null;
+        String link = o.optString("link", "");
+        String number = link.substring(link.lastIndexOf('/') + 1);
+        String full = number.matches("\\d+") ? "https://image.airport-data.com/aircraft/" + number + ".jpg" : "";
+        return new Photo(image, full, o.optString("photographer", ""), "airport-data.com", "");
+    }
+
+    /** planespotters.net, by transponder code or registration; null when there is no picture. */
+    static Photo parsePlanespotters(String json) throws JSONException {
+        JSONArray photos = new JSONObject(json).optJSONArray("photos");
+        if (photos == null || photos.length() == 0) return null;
+        JSONObject o = photos.getJSONObject(0);
+        JSONObject small = o.optJSONObject("thumbnail");
+        JSONObject large = o.optJSONObject("thumbnail_large");
+        String thumbnail = small == null ? "" : small.optString("src", "");
+        String full = large == null ? "" : large.optString("src", "");
+        if (!thumbnail.startsWith("https://") && !full.startsWith("https://")) return null;
+        return new Photo(thumbnail, full, o.optString("photographer", ""), "planespotters.net", "", o.optString("link", ""));
+    }
+
+    private static final java.util.regex.Pattern NOT_THE_AIRCRAFT = java.util.regex.Pattern.compile(
+            "cockpit|interior|cabin|engine|seat|panel|gear|wheel|tail|wing|livery|model|logo|diagram|drawing|museum|crash|wreck",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+    private static final java.util.regex.Pattern HTML_TAG = java.util.regex.Pattern.compile("<[^>]+>");
+
+    /** Searches to try for a type, most exact first: "Boeing 737NG 7H4/W", then "Boeing 737NG". Never just the maker. */
+    static List<String> photoSearches(String name) {
+        List<String> out = new ArrayList<>();
+        String[] words = name.trim().split("\\s+");
+        for (int n = words.length; n >= Math.min(2, words.length); n--) {
+            if (n == 0 || words[0].isEmpty()) break;
+            out.add(String.join(" ", java.util.Arrays.copyOf(words, n)));
+        }
+        return out;
+    }
+
+    /** Wikimedia Commons' search answer: the best-ranked wide picture of a whole aircraft; null when there is none. */
+    static Photo parseCommons(String json) throws JSONException {
+        JSONObject query = new JSONObject(json).optJSONObject("query");
+        JSONObject pages = query == null ? null : query.optJSONObject("pages");
+        if (pages == null) return null;
+        JSONObject best = null;
+        for (java.util.Iterator<String> keys = pages.keys(); keys.hasNext(); ) {
+            JSONObject page = pages.getJSONObject(keys.next());
+            JSONArray info = page.optJSONArray("imageinfo");
+            if (info == null || info.length() == 0 || NOT_THE_AIRCRAFT.matcher(page.optString("title", "")).find()) continue;
+            JSONObject image = info.getJSONObject(0);
+            if (image.optInt("width") <= image.optInt("height")) continue;
+            if (!image.optString("thumburl", "").startsWith("https://")) continue;
+            if (best == null || page.optInt("index", Integer.MAX_VALUE) < best.optInt("index", Integer.MAX_VALUE)) best = page;
+        }
+        if (best == null) return null;
+        JSONObject image = best.getJSONArray("imageinfo").getJSONObject(0);
+        JSONObject meta = image.optJSONObject("extmetadata");
+        String artist = meta == null ? "" : metadata(meta, "Artist");
+        String licence = meta == null ? "" : metadata(meta, "LicenseShortName");
+        // Its licence is what lets it be shown, so without one it is not used.
+        if (licence.isEmpty()) return null;
+        return new Photo(image.getString("thumburl"), "", artist, "Wikimedia Commons", licence);
+    }
+
+    private static String metadata(JSONObject meta, String name) {
+        JSONObject field = meta.optJSONObject(name);
+        String value = field == null ? "" : field.optString("value", "");
+        return HTML_TAG.matcher(value).replaceAll("").trim();
+    }
+
+    /**
+     * Recent positions of every aircraft in the live feed, kept by the app itself: with no outside limit to reach, there is
+     * a graph ready for most aircraft when they are picked, going back as far as they have been in the feed.
+     */
+    static final class History {
+        private static final long SPACING_MS = 30_000;
+        private static final long FORGET_MS = 15 * 60_000;
+        private static final int MAX_SAMPLES = 120;
+        private final java.util.Map<String, java.util.ArrayDeque<double[]>> samples = new java.util.HashMap<>();
+
+        synchronized void add(List<Plane> planes, long now) {
+            for (Plane p : planes) {
+                if (p.ground || p.estimated) continue;
+                java.util.ArrayDeque<double[]> list = samples.get(p.hex);
+                if (list == null) {
+                    list = new java.util.ArrayDeque<>();
+                    samples.put(p.hex, list);
+                } else if (now - (long) list.peekLast()[3] < SPACING_MS) {
+                    continue;
+                }
+                list.addLast(new double[]{p.worldX, p.worldY, p.altitudeFeet, now});
+                if (list.size() > MAX_SAMPLES) list.removeFirst();
+            }
+            for (java.util.Iterator<java.util.ArrayDeque<double[]>> it = samples.values().iterator(); it.hasNext(); ) {
+                if (now - (long) it.next().peekLast()[3] > FORGET_MS) it.remove();
+            }
+        }
+
+        /** Null until there are two positions. */
+        synchronized Track track(String hex) {
+            java.util.ArrayDeque<double[]> list = samples.get(hex);
+            if (list == null || list.size() < 2) return null;
+            int n = list.size();
+            double[] xs = new double[n];
+            double[] ys = new double[n];
+            int[] feet = new int[n];
+            long[] times = new long[n];
+            int i = 0;
+            for (double[] sample : list) {
+                xs[i] = sample[0];
+                ys[i] = sample[1];
+                feet[i] = (int) sample[2];
+                times[i++] = (long) sample[3];
+            }
+            return new Track(xs, ys, feet, 0, times[0], feet[0], times);
+        }
+    }
+
+    /** A flight's altitude and ground speed so far, in equal slices of time, for a small graph. */
+    static final class Profile {
+        final int[] feet;
+        final int[] knots;
+        final int maxFeet;
+        final int maxKnots;
+
+        Profile(int[] feet, int[] knots, int maxFeet, int maxKnots) {
+            this.feet = feet;
+            this.knots = knots;
+            this.maxFeet = maxFeet;
+            this.maxKnots = maxKnots;
+        }
+    }
+
+    private static final long PROFILE_MIN_STEP_MS = 15_000;
+    private static final int PROFILE_MAX_KNOTS = 750;
+
+    /**
+     * Speed is worked out from the path between points, as the path has no speed of its own; points very close in time, or
+     * implying an impossible speed, are position noise and left out. A slice with no reports holds the one before it.
+     */
+    static Profile profile(Track track, int slices) {
+        int[] feet = new int[slices];
+        int[] knots = new int[slices];
+        double[] sum = new double[slices];
+        int[] count = new int[slices];
+        boolean[] heard = new boolean[slices];
+        long start = track.times[0];
+        long span = Math.max(1, track.times[track.times.length - 1] - start);
+        for (int i = 0; i < track.times.length; i++) {
+            int slice = (int) Math.min(slices - 1, (track.times[i] - start) * slices / span);
+            feet[slice] = Math.max(feet[slice], track.feet[i]);
+            heard[slice] = true;
+            if (i == 0) continue;
+            long ms = track.times[i] - track.times[i - 1];
+            if (ms < PROFILE_MIN_STEP_MS) continue;
+            double speed = nauticalMiles(lat(track.ys[i - 1]), lon(track.xs[i - 1]), lat(track.ys[i]), lon(track.xs[i])) * 3_600_000 / ms;
+            if (speed <= PROFILE_MAX_KNOTS) {
+                sum[slice] += speed;
+                count[slice]++;
+            }
+        }
+        int maxFeet = 0;
+        int maxKnots = 0;
+        // The very first slice has no earlier point to work out a speed from.
+        if (count[0] == 0) {
+            for (int i = 1; i < slices && knots[0] == 0; i++) {
+                if (count[i] > 0) knots[0] = (int) (sum[i] / count[i]);
+            }
+        }
+        for (int i = 0; i < slices; i++) {
+            if (!heard[i] && i > 0) feet[i] = feet[i - 1];
+            knots[i] = count[i] > 0 ? (int) (sum[i] / count[i]) : i > 0 ? knots[i - 1] : knots[0];
+            maxFeet = Math.max(maxFeet, feet[i]);
+            maxKnots = Math.max(maxKnots, knots[i]);
+        }
+        return new Profile(feet, knots, maxFeet, maxKnots);
+    }
+
+    /** One airframe's details from adsbdb. */
+    static final class AircraftInfo {
+        final String name;
+        final String owner;
+
+        AircraftInfo(String name, String owner) {
+            this.name = name;
+            this.owner = owner;
+        }
+    }
+
+    /** Null when adsbdb does not know it. */
+    static AircraftInfo parseAircraft(String json) throws JSONException {
+        JSONObject response = new JSONObject(json).optJSONObject("response");
+        JSONObject aircraft = response == null ? null : response.optJSONObject("aircraft");
+        if (aircraft == null) return null;
+        String maker = aircraft.optString("manufacturer", "");
+        String type = aircraft.optString("type", "");
+        return new AircraftInfo(maker.isEmpty() ? type : maker + " " + type, aircraft.optString("registered_owner", ""));
+    }
+
+    /** hexdb.io's name for an airframe, as in "Cessna 680A"; empty when it does not know. */
+    static String parseHexdbName(String json) throws JSONException {
+        JSONObject o = new JSONObject(json);
+        String maker = o.optString("Manufacturer", "").trim();
+        String type = o.optString("Type", "").trim();
+        if (type.isEmpty()) return "";
+        // It often gives the maker in both fields.
+        return maker.isEmpty() || type.toLowerCase(java.util.Locale.ROOT).startsWith(maker.toLowerCase(java.util.Locale.ROOT)) ? type : maker + " " + type;
+    }
+
+    /** The VRS route data adsb.lol serves: a flight can have stops, so this is one route per leg. */
+    static List<Route> parseVrsRoute(String json) throws JSONException {
+        JSONArray airports = new JSONObject(json).optJSONArray("_airports");
+        List<Route> legs = new ArrayList<>();
+        if (airports == null) return legs;
+        for (int i = 0; i + 1 < airports.length(); i++) {
+            JSONObject from = airports.getJSONObject(i);
+            JSONObject to = airports.getJSONObject(i + 1);
+            legs.add(new Route("", vrsPlace(from), vrsPlace(to), vrsPoint(from), vrsPoint(to), from.optString("icao", ""), to.optString("icao", "")));
+        }
+        return legs;
+    }
+
+    private static String vrsPlace(JSONObject airport) {
+        String code = airport.optString("iata", "");
+        String town = airport.optString("location", "");
+        return town.isEmpty() ? code : code + " " + town;
+    }
+
+    private static double[] vrsPoint(JSONObject airport) {
+        if (!airport.has("lat") || !airport.has("lon")) return null;
+        return new double[]{airport.optDouble("lat"), airport.optDouble("lon")};
+    }
+
     /** The path a flight has flown so far, as world coordinates with the altitude at each point. */
     static final class Track {
         final double[] xs;
         final double[] ys;
         final int[] feet;
         final int flownNm;
+        /** When the path begins, and how high: a low start means it saw the takeoff. */
+        final long startMs;
+        final int startFeet;
+        /** When each point was reported. */
+        final long[] times;
 
-        Track(double[] xs, double[] ys, int[] feet, int flownNm) {
+        Track(double[] xs, double[] ys, int[] feet, int flownNm, long startMs, int startFeet, long[] times) {
+            this.times = times;
             this.xs = xs;
             this.ys = ys;
             this.feet = feet;
             this.flownNm = flownNm;
+            this.startMs = startMs;
+            this.startFeet = startFeet;
+        }
+
+        /** The path starts low enough to count as the takeoff, rather than coming into a receiver's range mid-flight. */
+        boolean sawTakeoff() {
+            return startFeet < TAKEOFF_MAX_FEET;
         }
     }
 
@@ -286,10 +738,17 @@ final class AirData {
             Object altitude = o.opt("alt_baro");
             boolean ground = "ground".equals(altitude);
             int feet = altitude instanceof Number ? ((Number) altitude).intValue() : 0;
-            out.add(new Plane(o.optString("hex", ""), o.optString("flight", "").trim(), type,
+            Plane plane = new Plane(o.optString("hex", ""), o.optString("flight", "").trim(), type,
                     o.optString("r", ""), ground, feet, (int) o.optDouble("gs", 0), (float) o.optDouble("track", 0),
                     o.optInt("baro_rate", 0), o.optString("squawk", ""), (o.optInt("dbFlags", 0) & 1) != 0,
-                    o.getDouble("lat"), o.getDouble("lon"), now - (long) (seen * 1000), category));
+                    o.getDouble("lat"), o.getDouble("lon"), now - (long) (seen * 1000), category);
+            // The autopilot's value comes in steps that do not land on round numbers: 20,992 means 21,000.
+            plane.targetFeet = (int) Math.round(o.optInt("nav_altitude_mcp", 0) / 100.0) * 100;
+            plane.description = o.optString("desc", "");
+            plane.windFrom = o.optInt("wd", -1);
+            plane.windKnots = o.optInt("ws", -1);
+            plane.mach = o.optDouble("mach", 0);
+            out.add(plane);
         }
         return out;
     }
@@ -325,7 +784,8 @@ final class AirData {
         JSONObject origin = route.optJSONObject("origin");
         JSONObject destination = route.optJSONObject("destination");
         return new Route(airline == null ? "" : airline.optString("name", ""), place(origin), place(destination),
-                point(origin), point(destination));
+                point(origin), point(destination), origin == null ? "" : origin.optString("icao_code", ""),
+                destination == null ? "" : destination.optString("icao_code", ""));
     }
 
     private static double[] point(JSONObject airport) {
@@ -342,10 +802,12 @@ final class AirData {
         if (path == null) return null;
         List<double[]> rows = new ArrayList<>();
         long last = 0;
+        long start = 0;
         for (int i = 0; i < path.length(); i++) {
             JSONArray p = path.getJSONArray(i);
             if (p.isNull(1) || p.isNull(2)) continue;
-            rows.add(new double[]{p.getDouble(1), p.getDouble(2), p.isNull(3) ? 0 : p.getDouble(3) * METRES_TO_FEET});
+            if (start == 0) start = p.optLong(0) * 1000;
+            rows.add(new double[]{p.getDouble(1), p.getDouble(2), p.isNull(3) ? 0 : p.getDouble(3) * METRES_TO_FEET, p.optLong(0) * 1000});
             last = p.optLong(0) * 1000;
         }
         if (rows.size() < 2 || now - last > TRACK_MAX_AGE_MS) return null;
@@ -354,18 +816,20 @@ final class AirData {
         double[] xs = new double[count];
         double[] ys = new double[count];
         int[] feet = new int[count];
+        long[] times = new long[count];
         double miles = 0;
         for (int i = 0; i < count; i++) {
             double[] row = rows.get(i * step);
             xs[i] = worldX(row[1]);
             ys[i] = worldY(row[0]);
             feet[i] = (int) row[2];
+            times[i] = (long) row[3];
             if (i > 0) {
                 double[] before = rows.get((i - 1) * step);
                 miles += nauticalMiles(before[0], before[1], row[0], row[1]);
             }
         }
-        return new Track(xs, ys, feet, (int) miles);
+        return new Track(xs, ys, feet, (int) miles, start, (int) rows.get(0)[2], times);
     }
 
     /** The shortest path over the globe as n+1 {worldX, worldY} points: a curve on this map, as real routes are. */

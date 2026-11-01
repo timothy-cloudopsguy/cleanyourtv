@@ -8,6 +8,7 @@ import android.graphics.ColorMatrixColorFilter;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.view.KeyEvent;
 
@@ -42,9 +43,11 @@ final class AirPanel extends Panel {
     private static final int LABEL_MIN_ZOOM = 8;
     private static final int TRAIL_MAX = 240;
     private static final int DASHES = 32;
-    private static final int[] ALT_FEET = {5_000, 15_000, 30_000, 45_000};
-    private static final int[] ALT_COLOR = {Ui.AMBER, Ui.GREEN, Ui.CYAN, Ui.BLUE, Ui.MAGENTA};
-    private static final String[] ALT_NAME = {"<5k", "<15k", "<30k", "<45k", "45k+"};
+    // Split where traffic really is, from a world snapshot: under 1% flies above 45,000 ft but about a quarter above
+    // 36,000. 10,000 ft is where a cabin's rules change.
+    private static final int[] ALT_FEET = {5_000, 10_000, 20_000, 30_000, 36_000};
+    private static final int[] ALT_COLOR = {0xFFFF8A3D, Ui.AMBER, Ui.GREEN, Ui.CYAN, Ui.BLUE, Ui.MAGENTA};
+    private static final String[] ALT_NAME = {"<5k", "<10k", "<20k", "<30k", "<36k", "36k+"};
     /** Away from every altitude colour and from emergency red, and always drawn on top. */
     private static final int MILITARY = 0xFFFFF200;
     private static final int ESTIMATE = 0xC0E8F1FA;
@@ -53,8 +56,19 @@ final class AirPanel extends Panel {
     /** Outline units fit within 32 either side of the middle; drawn at twice that so scaling stays sharp. */
     private static final int SPRITE_PX = 128;
     private static final float SPRITE_SCALE = 2f;
-    private static final float MODEL_W = 400;
-    private static final float MODEL_H = 300;
+    // The foot of the flight card: the graph across it, and under that the aircraft beside the QR code.
+    private static final float MODEL_W = 225;
+    private static final float MODEL_H = 168;
+    private static final float TILE_L = R - 448;
+    private static final float TILE_B = B - 70;
+    private static final float TILE_T = TILE_B - MODEL_H;
+    private static final float GRAPH_W = 410;
+    private static final float GRAPH_H = 96;
+    private static final float GRAPH_B = TILE_T - 10;
+    /** Exactly four pixels a module for the usual link here, so it stays as sharp as a larger code. */
+    private static final float QR_SIDE = 148;
+    private static final long QR_SWAP_MS = 8_000;
+    private static final int GRAPH_SLICES = 92;
     /** A held arrow repeats far faster than anyone can follow a highlight. */
     private static final long HOP_REPEAT_MS = 220;
     /** Fetching a path and route for every aircraft hopped past would soon use up the path feed's daily limit. */
@@ -70,7 +84,6 @@ final class AirPanel extends Panel {
     private static final float[][] COVERED_WATCHING = {
             {L + 14, T + 14, L + 590, T + 110},
             {L + 14, B - 104, L + 800, B - 12},
-            {R - 886, B - 66 - MODEL_H, R - 486, B - 66},
             {R - 470, T + 14, R, B},
     };
 
@@ -84,6 +97,13 @@ final class AirPanel extends Panel {
     private final Paint spritePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final Paint modelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint dashedRing = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint photoPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Rect photoCrop = new Rect();
+    /** What this app has recorded itself, for when OpenSky has no path to give. */
+    private AirData.Track liveTrack;
+    private AirData.Track profileFor;
+    private AirData.Profile profile;
+    private final float[] speedLine = new float[(GRAPH_SLICES - 1) * 4];
     private final Path face = new Path();
     private Aircraft.Mesh model;
     private int modelKind = -1;
@@ -105,6 +125,10 @@ final class AirPanel extends Panel {
     private boolean movedByHand;
     private boolean sentHome;
     private boolean controls;
+    /** The menu's second page. */
+    private boolean moreMenu;
+    /** Hides everything but military aircraft, and emergencies, which are never hidden. */
+    private boolean militaryOnly;
     private boolean picking;
     /** The aircraft highlighted while picking; null once it has been lost. */
     private AirData.Plane target;
@@ -124,10 +148,15 @@ final class AirPanel extends Panel {
     private int selectedMissed;
     private boolean selectedLost;
     private long watchedSince;
+    private AirData.RouteCheck routeCheck;
+    private int routeCheckVersion = -1;
+    private boolean routeSettled;
     private int selectedVersion = -1;
     private boolean follow;
     private String qrFor = "";
     private boolean[][] qr;
+    private String photoQrFor = "";
+    private boolean[][] photoQr;
     private int inView;
     private int militaryInView;
     private int estimatesInView;
@@ -250,7 +279,34 @@ final class AirPanel extends Panel {
         }
     }
 
+    private boolean moreKey(int key) {
+        switch (key) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+                goHome();
+                moreMenu = false;
+                controls = false;
+                return true;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                militaryOnly = !militaryOnly;
+                moreMenu = false;
+                controls = false;
+                deck.sfx.confirm();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_UP:
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+                return true;
+            default:
+                if (Ui.isOk(key)) {
+                    moreMenu = false;
+                    deck.sfx.tick();
+                    return true;
+                }
+                return false;
+        }
+    }
+
     private boolean controlKey(int key) {
+        if (moreMenu) return moreKey(key);
         switch (key) {
             case KeyEvent.KEYCODE_DPAD_UP:
                 zoomBy(1);
@@ -259,8 +315,8 @@ final class AirPanel extends Panel {
                 zoomBy(-1);
                 return true;
             case KeyEvent.KEYCODE_DPAD_LEFT:
-                goHome();
-                controls = false;
+                moreMenu = true;
+                deck.sfx.tick();
                 return true;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
                 selectPriority();
@@ -299,7 +355,7 @@ final class AirPanel extends Panel {
     }
 
     private AirData.PickView pickView() {
-        boolean shapesOnly = inView > GLYPH_LIMIT;
+        boolean shapesOnly = inView > GLYPH_LIMIT || militaryOnly;
         return new AirData.PickView(centerX, centerY, TILE_PX * Math.pow(2, zoom), L, T, R, B, shapesOnly,
                 selected != null ? COVERED_WATCHING : COVERED_ON_MAP);
     }
@@ -386,6 +442,10 @@ final class AirPanel extends Panel {
 
     @Override
     boolean back() {
+        if (moreMenu) {
+            moreMenu = false;
+            return true;
+        }
         if (controls) {
             controls = false;
             return true;
@@ -453,7 +513,7 @@ final class AirPanel extends Panel {
         List<AirData.Plane> all = new ArrayList<>(alarms);
         all.addAll(feed.planes);
         AirData.Plane next = AirData.nextPriority(all, current);
-        if (next == null) next = AirData.nearest(feed.planes, centerX, centerY, now, current);
+        if (next == null && !militaryOnly) next = AirData.nearest(feed.planes, centerX, centerY, now, current);
         if (next == null) {
             deck.sfx.tick();
             return;
@@ -480,9 +540,29 @@ final class AirPanel extends Panel {
         selectedVersion = feed.version;
         follow = true;
         watchedSince = now;
+        liveTrack = feed.history.track(plane.hex);
+        routeCheck = null;
+        routeCheckVersion = -1;
+        routeSettled = false;
         toGoFor = "";
         trail.clear();
         trail.add(new double[]{plane.xAt(now), plane.yAt(now)});
+    }
+
+    /**
+     * The route for the aircraft being watched, tested against where it is. A clear answer is kept for this aircraft, so
+     * a turn does not make the route flip or vanish; an unclear one is tried again as new positions come in.
+     */
+    private AirData.RouteCheck checkedRoute(long now) {
+        if (selected == null || !watchSettled(now)) return null;
+        if (routeSettled || routeCheckVersion == feed.version) return routeCheck;
+        AirData.RouteSet set = feed.routes(selected.callsign);
+        if (set == null) return null;
+        routeCheckVersion = feed.version;
+        routeCheck = AirData.checkRoute(set.legs, AirData.lat(selected.yAt(now)), AirData.lon(selected.xAt(now)), selected.track);
+        routeSettled = routeCheck.trusted();
+        toGoFor = "";
+        return routeCheck;
     }
 
     private boolean watchSettled(long now) {
@@ -516,7 +596,10 @@ final class AirPanel extends Panel {
         if (picking) drawTarget(c, world, now);
         if (selected != null) {
             drawCard(c, now);
-            drawModel(c, now);
+            drawProfile(c);
+            if (watchSettled(now)) feed.wantPhoto(selected.hex, selected.registration, selected.description);
+            if (feed.photo != null && watchSettled(now)) drawPhoto(c, feed.photo);
+            else drawModel(c, now);
         }
         if (controls) drawControls(c);
     }
@@ -551,6 +634,7 @@ final class AirPanel extends Panel {
                 follow = true;
                 trail.add(new double[]{fresh.worldX, fresh.worldY});
                 if (trail.size() > TRAIL_MAX) trail.remove(0);
+                liveTrack = feed.history.track(fresh.hex);
             } else if (++selectedMissed >= LOST_AFTER_REFRESHES) {
                 // Said out loud, rather than following a position that is no longer being reported.
                 selectedLost = true;
@@ -680,10 +764,10 @@ final class AirPanel extends Panel {
 
     /** Dashes on to the destination and a mark at each end. The route is looked up by flight number, so it is a best guess. */
     private void drawRoute(Canvas c, double world, long now) {
-        if (selected == null || !watchSettled(now)) return;
-        AirData.Route route = feed.route(selected.callsign);
-        if (route == null) return;
-        if (route.toPoint != null) {
+        AirData.RouteCheck check = checkedRoute(now);
+        if (check == null || check.route == null) return;
+        AirData.Route route = check.route;
+        if (route.toPoint != null && check.trusted()) {
             if (!selected.hex.equals(toGoFor) || toGoVersion != feed.version) {
                 toGoFor = selected.hex;
                 toGoVersion = feed.version;
@@ -750,6 +834,7 @@ final class AirPanel extends Panel {
             AirData.Plane p = planes.get(i);
             // Counted wherever it is: the banner should point to one off screen too.
             if (p.emergency()) alarms.add(p);
+            if (hidden(p)) continue;
             float x = screenX(p.xAt(now), world);
             float y = screenY(p.yAt(now), world);
             if (x < L || x > R || y < T || y > B) continue;
@@ -785,12 +870,16 @@ final class AirPanel extends Panel {
             drawDots(c);
         } else {
             for (int i = 0; i < planes.size(); i++) {
-                if (!planes.get(i).military) drawGlyph(c, planes.get(i), world, now, visible, selected != null);
+                if (!planes.get(i).military && !hidden(planes.get(i))) drawGlyph(c, planes.get(i), world, now, visible, selected != null);
             }
         }
         for (int i = 0; i < planes.size(); i++) {
             if (planes.get(i).military) drawGlyph(c, planes.get(i), world, now, visible, selected != null);
         }
+    }
+
+    private boolean hidden(AirData.Plane p) {
+        return militaryOnly && !p.military && !p.emergency();
     }
 
     private void drawSelected(Canvas c, double world, long now) {
@@ -920,6 +1009,7 @@ final class AirPanel extends Panel {
         String from = feed.source.isEmpty() ? (feed.locating ? "Finding this TV..." : "Pulling traffic...")
                 : feed.source + ", " + Parsers.ago(feed.updated, now) + " ago";
         Ui.mono(c, "z" + zoom + "  " + from, L + 32, T + 94, 21, Ui.DIM);
+        if (militaryOnly) Ui.right(c, "MILITARY ONLY", L + 575, T + 94, 21, MILITARY);
         if (emergencies > 0) {
             Ui.card(c, L + 604, T + 14, L + 1110, T + 110, Ui.RED);
             Ui.bold(c, (emergencies == 1 ? "EMERGENCY " : emergencies + " EMERGENCIES ") + emergencyName, L + 620, T + 54, 25, Ui.BG);
@@ -1001,46 +1091,102 @@ final class AirPanel extends Panel {
             y += 34;
         }
         boolean settled = watchSettled(now);
-        AirData.Route route = settled ? feed.route(p.callsign) : null;
+        AirData.RouteSet set = settled ? feed.routes(p.callsign) : null;
+        AirData.AircraftInfo info = settled ? feed.aircraft(p.hex) : null;
+        AirData.RouteCheck check = checkedRoute(now);
+        AirData.Route route = check == null ? null : check.route;
+        String operator = set != null && !set.airline.isEmpty() ? set.airline : info != null ? info.owner : "";
+        if (!operator.isEmpty()) {
+            Ui.line(c, operator, l + 22, y, r - l - 44, 25, Ui.CYAN, Ui.SANS);
+            y += 34;
+        }
+        if (info != null && !info.name.isEmpty()) {
+            Ui.line(c, info.name, l + 22, y, r - l - 44, 22, Ui.DIM, Ui.SANS);
+            y += 34;
+        }
+        if (!p.ground && p.altitudeFeet > 0 && p.altitudeFeet < 10_000 && AirData.airliner(p)) {
+            Ui.mono(c, "BELOW 10,000 FT: LAPTOPS AWAY", l + 22, y, 20, Ui.AMBER);
+            y += 32;
+        }
         if (route != null) {
-            if (!route.airline.isEmpty()) {
-                Ui.line(c, route.airline, l + 22, y, r - l - 44, 25, Ui.CYAN, Ui.SANS);
-                y += 36;
-            }
-            Ui.mono(c, "LIKELY ROUTE, BY FLIGHT NUMBER", l + 22, y, 18, Ui.FAINT);
+            Ui.mono(c, check.state == AirData.ROUTE_FLIPPED ? "LIKELY ROUTE, SWAPPED TO MATCH HEADING"
+                    : check.state == AirData.ROUTE_UNSURE ? "ROUTE ON FILE, HEADING DOES NOT MATCH" : "LIKELY ROUTE, CHECKED AGAINST POSITION",
+                    l + 22, y, 18, check.trusted() ? Ui.FAINT : Ui.AMBER);
             y += 30;
             Ui.line(c, "FROM " + route.from, l + 22, y, r - l - 44, 24, Ui.TEXT, Ui.SANS);
             y += 34;
             Ui.line(c, "TO   " + route.to, l + 22, y, r - l - 44, 24, Ui.TEXT, Ui.SANS);
             y += 42;
+        } else if (check != null && !set.legs.isEmpty()) {
+            Ui.mono(c, "ROUTE ON FILE DOES NOT FIT THIS FLIGHT", l + 22, y, 18, Ui.FAINT);
+            y += 36;
         }
-        if (route != null && route.toPoint != null) {
-            y = field(c, "TO GO", String.format(Locale.US, "%,.0f nm", AirData.nauticalMiles(AirData.lat(p.yAt(now)),
-                    AirData.lon(p.xAt(now)), route.toPoint[0], route.toPoint[1])), l, y);
+        if (route != null && check.trusted()) {
+            AirData.Weather weather = feed.weather(route.toIcao, now);
+            if (weather != null && !weather.line.isEmpty()) {
+                String airport = route.to.indexOf(' ') > 0 ? route.to.substring(0, route.to.indexOf(' ')) : route.to;
+                String line = airport + " NOW: " + (weather.category.isEmpty() ? "" : weather.category + ", ") + weather.line;
+                Ui.line(c, line, l + 22, y, r - l - 44, 22, weatherColor(weather.category), Ui.SANS);
+                y += 36;
+            }
         }
-        AirData.Track track = feed.currentTrack;
+        // Most wanted first: on a busy card the last ones are left out rather than running into the graph.
+        float last = GRAPH_B - GRAPH_H - 8;
+        if (route != null && route.toPoint != null && check.trusted()) {
+            double toGoNm = AirData.nauticalMiles(AirData.lat(p.yAt(now)), AirData.lon(p.xAt(now)), route.toPoint[0], route.toPoint[1]);
+            if (y < last) y = field(c, "TO GO", String.format(Locale.US, "%,.0f nm", toGoNm), l, y);
+            int minutes = AirData.minutesToLand(toGoNm, p.speedKnots, AirData.cruiseKnots(p.kind));
+            if (minutes >= 0 && y < last) y = field(c, "LANDS", "about " + AirData.duration(minutes) + ", " + clock(now + minutes * 60_000L), l, y);
+        }
         // Until it settles, this could still be the path of the aircraft hopped from.
-        y = field(c, "FLOWN", !settled ? "" : track != null ? String.format(Locale.US, "%,d nm seen", track.flownNm) : feed.trackState, l, y);
-        y = field(c, "TYPE", join(p.type, p.registration), l, y);
-        y = field(c, "ALTITUDE", p.ground ? "on the ground" : String.format(Locale.US, "%,d ft %s", p.altitudeFeet, climbWord(p.climbFpm)), l, y);
-        y = field(c, "SPEED", p.speedKnots + " kt", l, y);
-        y = field(c, "HEADING", String.format(Locale.US, "%03.0f deg", p.track), l, y);
-        field(c, "POSITION", String.format(Locale.US, "%.2f, %.2f", AirData.lat(p.yAt(now)), AirData.lon(p.xAt(now))), l, y);
+        AirData.Track track = settled ? feed.currentTrack : null;
+        if (track != null && y < last) {
+            String flown = AirData.duration(Math.max(0, now - track.startMs) / 60_000);
+            y = field(c, track.sawTakeoff() ? "IN AIR" : "TRACKED", flown + (track.sawTakeoff() ? "" : "+")
+                    + String.format(Locale.US, ", %,d nm", track.flownNm), l, y);
+        }
+        if (y < last) y = field(c, "ALTITUDE", p.ground ? "on the ground" : String.format(Locale.US, "%,d ft %s", p.altitudeFeet, climbWord(p.climbFpm)), l, y);
+        if (p.targetFeet > 0 && Math.abs(p.targetFeet - p.altitudeFeet) > 300 && y < last) {
+            y = field(c, "SET TO", String.format(Locale.US, "%,d ft", p.targetFeet), l, y);
+        }
+        if (y < last) y = field(c, "SPEED", p.speedKnots + " kt" + (p.mach > 0 ? String.format(Locale.US, "  mach %.2f", p.mach) : ""), l, y);
+        if (y < last) y = field(c, "TYPE", join(p.type, p.registration), l, y);
+        if (settled && track == null && liveTrack != null && y < last) {
+            y = field(c, "SEEN FOR", AirData.duration(Math.max(0, now - liveTrack.startMs) / 60_000) + "+", l, y);
+        }
+        if (settled && track == null && !feed.trackState.isEmpty() && y < last) y = field(c, "PATH", feed.trackState, l, y);
+        if (p.windKnots >= 0 && p.windFrom >= 0 && y < last) {
+            y = field(c, "WIND", String.format(Locale.US, "%d kt from %03d", p.windKnots, p.windFrom), l, y);
+        }
+        if (y < last) y = field(c, "HEADING", String.format(Locale.US, "%03.0f deg", p.track), l, y);
+        if (y < last) field(c, "POSITION", String.format(Locale.US, "%.2f, %.2f", AirData.lat(p.yAt(now)), AirData.lon(p.xAt(now))), l, y);
         String link = "https://globe.adsbexchange.com/?icao=" + p.hex;
         if (!link.equals(qrFor)) {
             qrFor = link;
             qr = Qr.encode(link);
         }
-        if (qr != null) Ui.qr(c, qr, l + 22, b - 182, 164);
-        Ui.mono(c, "SCAN TO TRACK", l + 200, b - 118, 20, Ui.TEXT);
-        Ui.mono(c, follow ? "Following" : "Not following", l + 200, b - 88, 20, Ui.DIM);
-        Ui.mono(c, "Back to browse", l + 200, b - 58, 20, Ui.DIM);
+        float qrLeft = TILE_L + MODEL_W + 15;
+        // A source can ask for its picture to link to its page. A TV has no links, so the code takes turns showing that.
+        AirData.Photo shown = feed.photo == null ? null : feed.photoDetails;
+        String photoLink = shown == null ? "" : shown.link;
+        if (!photoLink.equals(photoQrFor)) {
+            photoQrFor = photoLink;
+            photoQr = photoLink.isEmpty() ? null : Qr.encode(photoLink);
+        }
+        boolean showPhotoPage = photoQr != null && (now / QR_SWAP_MS) % 2 == 1;
+        boolean[][] code = showPhotoPage ? photoQr : qr;
+        if (code != null) Ui.qr(c, code, qrLeft, TILE_T, QR_SIDE);
+        Ui.centre(c, showPhotoPage ? "SCAN: PHOTO PAGE" : "SCAN TO TRACK", qrLeft + QR_SIDE / 2, TILE_B, 15, Ui.DIM);
     }
 
     /** The selected aircraft's class as a slowly turning solid: its faces are flat-shaded and painted back to front. */
     private void drawModel(Canvas c, long now) {
         int kind = selected.kind;
-        if (kind == Aircraft.UNKNOWN) return;
+        if (kind == Aircraft.UNKNOWN) {
+            Ui.card(c, TILE_L, TILE_T, TILE_L + MODEL_W, TILE_B, Ui.PANEL);
+            Ui.centre(c, "NO PHOTO, TYPE UNKNOWN", TILE_L + MODEL_W / 2, (TILE_T + TILE_B) / 2, 15, Ui.FAINT);
+            return;
+        }
         if (kind != modelKind) {
             modelKind = kind;
             model = Aircraft.model(kind);
@@ -1049,13 +1195,13 @@ final class AirPanel extends Panel {
             order = new int[depths.length];
             for (int i = 0; i < order.length; i++) order[i] = i;
         }
-        float r = R - 486;
-        float l = r - MODEL_W;
-        float b = B - 66;
-        float t = b - MODEL_H;
-        Ui.card(c, l, t, r, b, 0xF0060A12);
-        Ui.bold(c, Aircraft.name(kind).toUpperCase(Locale.ROOT), l + 18, t + 36, 23, Ui.TEXT);
-        Ui.mono(c, "SHAPE OF ITS CLASS, NOT THIS AIRFRAME", l + 18, b - 14, 15, Ui.FAINT);
+        float l = TILE_L;
+        float r = l + MODEL_W;
+        float b = TILE_B;
+        float t = TILE_T;
+        Ui.card(c, l, t, r, b, Ui.PANEL);
+        Ui.mono(c, Aircraft.name(kind).toUpperCase(Locale.ROOT), l + 12, t + 24, 16, Ui.TEXT);
+        Ui.mono(c, "CLASS SHAPE ONLY", l + 12, b - 10, 14, Ui.FAINT);
 
         double yaw = (now % 16_000) / 16_000.0 * 2 * Math.PI;
         float cosY = (float) Math.cos(yaw);
@@ -1128,7 +1274,97 @@ final class AirPanel extends Panel {
     private static float field(Canvas c, String name, String value, float l, float y) {
         Ui.mono(c, name, l + 22, y, 20, Ui.FAINT);
         Ui.mono(c, value.isEmpty() ? "--" : value, l + 150, y, 23, Ui.TEXT);
-        return y + 36;
+        return y + 32;
+    }
+
+    /** The usual chart colours for flying conditions. */
+    private static int weatherColor(String category) {
+        switch (category) {
+            case "VFR": return Ui.GREEN;
+            case "MVFR": return Ui.BLUE;
+            case "IFR": return Ui.RED;
+            case "LIFR": return Ui.MAGENTA;
+            default: return Ui.TEXT;
+        }
+    }
+
+    /** The real aircraft, cropped to the tile, with the credit its photographer is owed. */
+    private void drawPhoto(Canvas c, Bitmap bitmap) {
+        float l = TILE_L;
+        float r = l + MODEL_W;
+        float b = TILE_B;
+        float t = TILE_T;
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        int cropWidth = Math.min(width, (int) (height * MODEL_W / MODEL_H));
+        int cropHeight = Math.min(height, (int) (width * MODEL_H / MODEL_W));
+        photoCrop.set((width - cropWidth) / 2, (height - cropHeight) / 2, (width + cropWidth) / 2, (height + cropHeight) / 2);
+        dest.set(l, t, r, b);
+        c.drawBitmap(bitmap, photoCrop, dest, photoPaint);
+        AirData.Photo details = feed.photoDetails;
+        if (details == null) return;
+        String by = details.photographer.isEmpty() ? "Photo" : "Photo: " + details.photographer;
+        Ui.FILL.setColor(0xD0060A12);
+        if (details.similarOnly()) {
+            // Must not pass for the aircraft on the map, and its licence asks for the credit and the terms.
+            c.drawRect(l, b - 60, r, b, Ui.FILL);
+            Ui.mono(c, "SIMILAR, NOT THIS AIRCRAFT", l + 8, b - 43, 13, Ui.AMBER);
+            Ui.line(c, by, l + 8, b - 24, MODEL_W - 16, 14, Ui.TEXT, Ui.SANS);
+            Ui.line(c, details.licence + ", Wikimedia", l + 8, b - 7, MODEL_W - 16, 13, Ui.DIM, Ui.SANS);
+        } else {
+            c.drawRect(l, b - 42, r, b, Ui.FILL);
+            Ui.line(c, by, l + 8, b - 24, MODEL_W - 16, 15, Ui.TEXT, Ui.SANS);
+            Ui.mono(c, details.source, l + 8, b - 7, 14, Ui.DIM);
+        }
+    }
+
+    /** Altitude as bars in the map's colours, with ground speed over it as a line. */
+    private void drawProfile(Canvas c) {
+        boolean live = feed.currentTrack == null;
+        AirData.Track track = live ? liveTrack : feed.currentTrack;
+        float l = TILE_L;
+        float r = l + GRAPH_W;
+        float b = GRAPH_B;
+        float t = b - GRAPH_H;
+        Ui.card(c, l, t, r, b, Ui.PANEL);
+        if (track == null || !watchSettled(System.currentTimeMillis())) {
+            Ui.centre(c, "GRAPH BUILDS AS IT FLIES", (l + r) / 2, (t + b) / 2 + 5, 15, Ui.FAINT);
+            return;
+        }
+        if (track != profileFor) {
+            profileFor = track;
+            profile = AirData.profile(track, GRAPH_SLICES);
+        }
+        Ui.mono(c, String.format(Locale.US, "ALT %,d FT", profile.maxFeet), l + 12, t + 20, 15, Ui.DIM);
+        Ui.right(c, "LINE " + profile.maxKnots + " KT", r - 12, t + 20, 15, Ui.TEXT);
+        if (live) Ui.centre(c, "SEEN LIVE", (l + r) / 2, t + 20, 13, Ui.FAINT);
+        float left = l + 12;
+        float bottom = b - 10;
+        float height = GRAPH_H - 36;
+        float slice = (GRAPH_W - 24) / GRAPH_SLICES;
+        float feetScale = height / Math.max(1, profile.maxFeet);
+        float speedScale = height / Math.max(1, profile.maxKnots);
+        for (int i = 0; i < GRAPH_SLICES; i++) {
+            int feet = Math.max(0, profile.feet[i]);
+            Ui.FILL.setColor(altitudeColor(feet));
+            c.drawRect(left + i * slice, bottom - feet * feetScale, left + (i + 1) * slice - 1, bottom, Ui.FILL);
+        }
+        for (int i = 0; i + 1 < GRAPH_SLICES; i++) {
+            speedLine[i * 4] = left + (i + 0.5f) * slice;
+            speedLine[i * 4 + 1] = bottom - profile.knots[i] * speedScale;
+            speedLine[i * 4 + 2] = left + (i + 1.5f) * slice;
+            speedLine[i * 4 + 3] = bottom - profile.knots[i + 1] * speedScale;
+        }
+        Ui.STROKE.setColor(Ui.TEXT);
+        Ui.STROKE.setStrokeWidth(2);
+        c.drawLines(speedLine, Ui.STROKE);
+    }
+
+    /** A time of day, in the 24-hour form the deck's own clock uses. */
+    private static String clock(long ms) {
+        java.util.Calendar at = java.util.Calendar.getInstance();
+        at.setTimeInMillis(ms);
+        return String.format(Locale.US, "%02d:%02d", at.get(java.util.Calendar.HOUR_OF_DAY), at.get(java.util.Calendar.MINUTE));
     }
 
     private static String join(String a, String b) {
@@ -1151,11 +1387,20 @@ final class AirPanel extends Panel {
         Ui.STROKE.setStrokeWidth(3);
         dest.set(l, t, l + w, t + h);
         c.drawRoundRect(dest, 10, 10, Ui.STROKE);
+        if (moreMenu) {
+            Ui.centre(c, "MORE", MX, t + 52, 30, Ui.BLUE);
+            Ui.centre(c, "LEFT", l + 170, t + 190, 30, Ui.TEXT);
+            Ui.centre(c, "HOME", l + 170, t + 222, 22, Ui.DIM);
+            Ui.centre(c, "RIGHT", l + w - 200, t + 190, 30, Ui.TEXT);
+            Ui.centre(c, militaryOnly ? "SHOW ALL AIRCRAFT" : "MILITARY ONLY", l + w - 200, t + 222, 22, MILITARY);
+            Ui.centre(c, "OK OR BACK RETURNS", MX, t + 382, 20, Ui.FAINT);
+            return;
+        }
         Ui.centre(c, "MAP CONTROLS", MX, t + 52, 30, Ui.BLUE);
         Ui.centre(c, "UP", MX, t + 120, 30, Ui.TEXT);
         Ui.centre(c, "ZOOM IN", MX, t + 152, 22, Ui.DIM);
         Ui.centre(c, "LEFT", l + 120, t + 210, 30, Ui.TEXT);
-        Ui.centre(c, "HOME", l + 120, t + 242, 22, Ui.DIM);
+        Ui.centre(c, "HOME, FILTER", l + 120, t + 242, 22, Ui.DIM);
         Ui.centre(c, "RIGHT", l + w - 130, t + 210, 30, Ui.TEXT);
         boolean anyEmergency = emergencies > 0;
         boolean anyMilitary = false;

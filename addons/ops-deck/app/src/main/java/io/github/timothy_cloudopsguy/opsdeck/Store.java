@@ -35,7 +35,7 @@ final class Store {
     private static final int KEV_KEPT = 20;
     private static final int KP_READINGS = 24;
     private static final int HEADLINES_PER_SOURCE = 12;
-    private static final String USER_AGENT = "OpsDeck/1.0 (Android TV add-on)";
+    private static final String USER_AGENT = "OpsDeck/1.0 (+https://github.com/timothy-cloudopsguy/cleanyourtv)";
 
     static final int VULNS = 0;
     static final int TECH = 1;
